@@ -27,13 +27,23 @@ st.caption("Multi-vendor PSW support with Firm PO Reconciliation Gap logic")
 with st.expander("Backend logic summary", expanded=False):
     st.markdown(
         """
-- **F Wk3 for optimizer** = main vendor PSW `F` at Target Week only.
-- **Other Vendor Supply** = explicit other/sub vendor PSW `F` supply when uploaded and matched as other vendor.
-- **Firm PO Reconciliation Gap** = Timeline Firm PO at mapped ETA week minus PSW F used for reconciliation.
-- **Total Supply Added to SI** = Main Vendor F Wk3 + Other Vendor Supply + Firm PO Reconciliation Gap.
-- **New SI** = Current SI + Total Supply Added to SI.
-- **New SI-SS** = Current SI-SS + Total Supply Added to SI.
-- **SI After** = New SI + Net Destination Change.
+        **Input files:**
+        1. `PlanDetailTimeline.csv` raw export file. Timeline weeks are treated as ETA.
+        2. One or more `PSW / Production Schedule.csv` raw export files. PSW weeks are treated as ETD.
+        3. One or two `DueDateCalc.xlsx` transit/offset files.
+
+        **PSW vendor role rule:**
+        - If PSW vendor matches the PlanDetailTimeline vendor, it is treated as **main vendor**.
+        - If PSW vendor does not match the PlanDetailTimeline vendor, it is treated as **other/sub vendor**.
+        - 2nd and later PSW files are forced as **other/sub vendor source**.
+        - One PSW file can contain both main and sub vendors.
+
+        **Inventory logic:**
+        - Main vendor Target Week quantity becomes `F Wk3` and is used for optimizer allocation.
+        - Other vendor quantity is added only to `New SI` and `New SI-SS`; it is not reallocated by optimizer.
+        - DueDateCalc upload order: 1st file = main/default vendor transit; 2nd file = sub/other vendor transit.
+        - If only one `DueDateCalc.xlsx` is uploaded, main and other vendors use the same warehouse transit time.
+        - If a PSW row has its own transit columns such as Transit Days, Delivery Days, Lead Time, or Transit Weeks, that row-level transit is used.
         """
     )
 
