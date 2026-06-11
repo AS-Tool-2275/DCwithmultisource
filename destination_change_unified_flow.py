@@ -1,0 +1,2258 @@
+"""
+Destination Change Unified Flow
+
+Input:
+  1) PlanDetailTimeline raw CSV (chua bo 6 dong dau)
+  2) Production Schedule raw CSV (chua bo 6 dong dau)
+  3) DueDateCalc Excel
+  4) Target Week / Wk3
+
+Output:
+  Final optimized Excel, co them debug sheets de kiem tra logic.
+
+Default behavior:
+  - F Wk3 lay tu Production Schedule/PSW, chi lay S/F/P = F cua main vendor.
+  - PlanDetailTimeline duoc convert ETA -> ETD bang DueDateCalc.
+  - Offset mac dinh la legacy compatible de match SI-SS_WANEK 3.py hien tai.
+    Neu muon dung thuan DueDateCalc: chay voi offset_mode="due_date".
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
+
+import pandas as pd
+import numpy as np
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox, simpledialog
+except Exception:
+    tk = None
+    ttk = None
+    filedialog = None
+    messagebox = None
+    simpledialog = None
+
+# ============================================================
+# Config
+# ============================================================
+
+OUTPUT_COLUMNS = [
+    "Item",
+    "ProdResourceID",
+    "Whse",
+    "F Wk3",
+    "Sum of SI Wk3",
+    "Sum of SI-SS Wk3",
+    "Average of SS Wk3",
+    "Vendor",
+    # Multi-vendor audit columns. These are optional and are populated when PSW vendor detail is available.
+    "Main Vendor",
+    "Main Vendor F Wk3",
+    "Other Vendor Supply",
+    "Other Vendor List",
+    "Timeline Firm PO",
+    "PSW F Used for Reconciliation",
+    "Firm PO Reconciliation Gap",
+    "Total Supply Added to SI",
+]
+
+DTYPE_MAP = {
+    "FIRM DEMAND": "FIRM DEMANDS",
+    "FIRM DEMANDS": "FIRM DEMANDS",
+    "FIRM POS": "FIRM POS",
+    "FIRM PO": "FIRM POS",
+    "PLANNED POS": "PLANNED POS",
+    "PLANNED PO": "PLANNED POS",
+    "SHIPPABLE INV": "SHIPPABLE INV",
+    "SHIPPABLE INVENTORY": "SHIPPABLE INV",
+    "SAFETY STK": "SAFETY STK",
+    "SAFETY STOCK": "SAFETY STK",
+    "NET FCST": "NET FCST",
+    "NET FORECAST": "NET FCST",
+}
+
+# Mapping dung theo SI-SS_WANEK 3.py hien tai.
+# Dung de dam bao file output match logic hien tai khi DueDateCalc hien tai duoc dung.
+LEGACY_WANEK_OFFSETS = {
+    "1": 9,
+    "5": 5,
+    "12": 8,
+    "15": 7,
+    "151": 7,
+    "16": 8,
+    "17": 8,
+    "18": 8,
+    "19": 8,
+    "20": 8,
+    "201": 8,
+    "242": 5,
+    "28": 6,
+    "3": 7,
+    "335": 1,
+    "42": 6,
+    "49": 5,
+    "60": 7,
+    "70": 10,
+    "ECR": 7,
+    "ALL": 10,
+}
+
+HEADER_FILL = PatternFill("solid", fgColor="1F4E78")
+HEADER_FONT = Font(color="FFFFFF", bold=True)
+VENDOR_FALLBACK_COL = "Vendor"
+
+
+# ============================================================
+# Common helpers
+# ============================================================
+
+def normalize_item(value) -> str:
+    """Clean Item # values like ="01226" -> 1226."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    m = re.match(r'^=\s*"(.*)"$', text)
+    if m:
+        text = m.group(1).strip()
+    text = text.strip().strip('"').strip()
+    # Ashley exports often keep leading zero as Excel formula text. Existing output uses integer-like item.
+    if re.fullmatch(r"0*\d+", text):
+        return str(int(text))
+    return text
+
+
+def normalize_whse(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    m = re.match(r'^=\s*"(.*)"$', text)
+    if m:
+        text = m.group(1).strip()
+    try:
+        f = float(text)
+        if f.is_integer():
+            return str(int(f))
+    except Exception:
+        pass
+    return text.strip().upper()
+
+
+def clean_dtype(series: pd.Series) -> pd.Series:
+    s = series.fillna("").astype(str).str.strip().str.upper()
+    return s.map(lambda x: DTYPE_MAP.get(x, x))
+
+
+def parse_user_date(text: str) -> date:
+    text = str(text).strip()
+    for fmt in ("%m/%d/%Y", "%m/%d/%y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return pd.to_datetime(text).date()
+
+
+def fmt_date(d: date) -> str:
+    return f"{d.month}/{d.day}/{d.year}"
+
+
+def saturday_of_current_week(today: Optional[date] = None) -> date:
+    if today is None:
+        today = date.today()
+    return today + timedelta(days=(5 - today.weekday()) % 7)
+
+
+def ensure_unique_output_path(path: str) -> str:
+    path = os.path.abspath(path)
+    if not os.path.exists(path):
+        return path
+    folder, filename = os.path.split(path)
+    stem, ext = os.path.splitext(filename)
+    idx = 1
+    while True:
+        candidate = os.path.join(folder, f"{stem}_{idx}{ext}")
+        if not os.path.exists(candidate):
+            return candidate
+        idx += 1
+
+
+def read_report_csv(path: str, dtype=str) -> pd.DataFrame:
+    """Read Ashley report CSV that has metadata lines before actual header."""
+    header_row = None
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for i, line in enumerate(f):
+            if line.lstrip().startswith("Item #"):
+                header_row = i
+                break
+    if header_row is None:
+        raise ValueError(f"Khong tim thay dong header 'Item #' trong file: {path}")
+    df = pd.read_csv(path, skiprows=header_row, dtype=dtype, low_memory=False, index_col=False)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def extract_report_date_from_csv(path: str) -> Optional[datetime]:
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for _ in range(10):
+            line = f.readline()
+            if not line:
+                break
+            if "Report Date" in line:
+                text = line.split(":", 1)[-1].strip()
+                try:
+                    return pd.to_datetime(text).to_pydatetime()
+                except Exception:
+                    return None
+    return None
+
+
+def parse_header_to_date(col_name) -> Optional[date]:
+    if isinstance(col_name, (datetime, pd.Timestamp)):
+        return pd.to_datetime(col_name).date()
+    text = str(col_name).strip()
+    try:
+        return pd.to_datetime(text).date()
+    except Exception:
+        return None
+
+
+def build_date_column_map(df: pd.DataFrame) -> Dict[date, str]:
+    mapping = {}
+    for c in df.columns:
+        d = parse_header_to_date(c)
+        if d is not None:
+            mapping[d] = c
+    return mapping
+
+
+def date_range_saturdays(start_date: date, end_date: date) -> List[date]:
+    out = []
+    cur = start_date
+    while cur <= end_date:
+        out.append(cur)
+        cur += timedelta(days=7)
+    return out
+
+
+def get_numeric(df: pd.DataFrame, col) -> pd.Series:
+    if col not in df.columns:
+        return pd.Series(0.0, index=df.index)
+    return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+
+def group_value(df: pd.DataFrame, key_cols, value_col, output_name) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=key_cols + [output_name])
+    out = df.groupby(key_cols, dropna=False, as_index=False)[value_col].sum()
+    return out.rename(columns={value_col: output_name})
+
+
+# ============================================================
+# Step 1: DueDateCalc -> warehouse offset
+# ============================================================
+
+def load_due_date_offsets(due_date_calc_path: str, offset_mode: str = "legacy_compatible") -> Tuple[Dict[str, int], pd.DataFrame]:
+    """
+    offset_mode:
+      - legacy_compatible: use SI-SS_WANEK 3.py offsets when whse exists there, otherwise ceil(Delivery Days/7).
+      - due_date: always use ceil(Delivery Days/7).
+    """
+    raw = pd.read_excel(due_date_calc_path, sheet_name=0, header=None)
+    header_idx = None
+    for i in range(len(raw)):
+        vals = [str(x).strip() for x in raw.iloc[i].tolist()]
+        if "Warehouse" in vals and any("Delivery Days" in v for v in vals):
+            header_idx = i
+            break
+    if header_idx is None:
+        raise ValueError("Khong tim thay header Warehouse / Delivery Days trong DueDateCalc.")
+
+    df = pd.read_excel(due_date_calc_path, sheet_name=0, header=header_idx)
+    df.columns = [str(c).strip() for c in df.columns]
+    delivery_col = next((c for c in df.columns if "Delivery Days" in c), None)
+    if delivery_col is None:
+        raise ValueError("DueDateCalc thieu cot Delivery Days.")
+
+    rows = []
+    offset_map = {}
+    for _, r in df.iterrows():
+        warehouse_text = str(r.get("Warehouse", "")).strip()
+        if not warehouse_text or warehouse_text.lower() == "nan":
+            continue
+        whse = normalize_whse(warehouse_text.split("-", 1)[0])
+        if not whse:
+            continue
+        days = pd.to_numeric(r.get(delivery_col), errors="coerce")
+        if pd.isna(days):
+            continue
+        due_calc_offset = max(1, int(math.ceil(float(days) / 7.0)))
+        legacy_offset = LEGACY_WANEK_OFFSETS.get(whse)
+        if offset_mode == "legacy_compatible" and legacy_offset is not None:
+            used_offset = int(legacy_offset)
+            source = "SI-SS_WANEK legacy"
+        else:
+            used_offset = due_calc_offset
+            source = "DueDateCalc ceil(days/7)"
+        offset_map[whse] = used_offset
+        rows.append({
+            "Whse": whse,
+            "Warehouse": warehouse_text,
+            "Delivery Days": float(days),
+            "DueDateCalc Offset Weeks": due_calc_offset,
+            "Legacy Offset Weeks": legacy_offset,
+            "Used Offset Weeks": used_offset,
+            "Offset Source": source,
+            "Offset Delta Used_vs_DueDate": used_offset - due_calc_offset,
+        })
+    if not offset_map:
+        raise ValueError("Khong doc duoc warehouse offset tu DueDateCalc.")
+    return offset_map, pd.DataFrame(rows)
+
+
+# ============================================================
+# Step 2: PlanDetailTimeline ETA -> ETD
+# ============================================================
+
+def convert_plan_eta_to_etd(plan_csv_path: str, offset_map: Dict[str, int]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    raw = read_report_csv(plan_csv_path, dtype=str)
+    required = ["Item #", "Whse", "Data Type"]
+    missing = [c for c in required if c not in raw.columns]
+    if missing:
+        raise ValueError(f"PlanDetailTimeline thieu cot: {missing}")
+
+    raw = raw.copy()
+    raw["Item #"] = raw["Item #"].map(normalize_item)
+    raw["Whse"] = raw["Whse"].map(normalize_whse)
+    raw["Data Type"] = raw["Data Type"].fillna("").astype(str).str.strip()
+
+    # Robustly detect weekly date columns by header value.
+    # Older logic used raw.columns[3:-20], but some PlanDetailTimeline exports have a
+    # different number of master-data columns, which can accidentally include fields
+    # like "Item Class" in the date range.
+    original_date_cols = []
+    original_dates = []
+    for c in raw.columns:
+        d = parse_header_to_date(c)
+        if d is not None:
+            original_date_cols.append(c)
+            original_dates.append(d)
+    if not original_date_cols:
+        raise ValueError("PlanDetailTimeline khong co cot ngay tuan o vi tri expected.")
+
+    # Match SI-SS_WANEK 3.py: extend 22 weeks (154 days) backward.
+    extended_dates = [d - timedelta(days=154) for d in original_dates]
+    all_dates = extended_dates + original_dates
+    date_labels = [fmt_date(d) for d in all_dates]
+
+    out_values = pd.DataFrame(0.0, index=raw.index, columns=date_labels)
+    numeric_original = raw[original_date_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    unknown_whse = set()
+    offset_used_by_row = []
+    for whse, idx in raw.groupby("Whse", sort=False).groups.items():
+        offset = offset_map.get(whse)
+        if offset is None:
+            # Safe fallback: no shift. Debug will expose this.
+            offset = 0
+            unknown_whse.add(whse)
+        offset_used_by_row.extend([(i, offset) for i in idx])
+        shifted_labels = [fmt_date(d - timedelta(days=7 * offset)) for d in original_dates]
+        # Some shifted labels may be outside all_dates if offset > 22; ignore those safely.
+        for src_col, dst_label in zip(original_date_cols, shifted_labels):
+            if dst_label in out_values.columns:
+                out_values.loc[idx, dst_label] = numeric_original.loc[idx, src_col].values
+
+    master_cols = list(raw.columns[-20:]) if len(raw.columns) >= 23 else []
+    converted = pd.concat([raw[required].reset_index(drop=True), out_values.reset_index(drop=True), raw[master_cols].reset_index(drop=True)], axis=1)
+
+    debug = pd.DataFrame([
+        ["Plan rows", len(raw)],
+        ["Original first week", fmt_date(min(original_dates))],
+        ["Original last week", fmt_date(max(original_dates))],
+        ["Converted first ETD week", fmt_date(min(all_dates))],
+        ["Converted last ETD week", fmt_date(max(all_dates))],
+        ["Unknown Whse count", len(unknown_whse)],
+        ["Unknown Whse list", ", ".join(sorted(unknown_whse))],
+    ], columns=["Field", "Value"])
+    return converted, debug
+
+
+# ============================================================
+# Step 3: Production Schedule -> F Wk3
+# ============================================================
+
+def build_production_date_map(columns: Iterable[str], report_date: Optional[datetime], target_week: date) -> Dict[date, str]:
+    date_cols = []
+    for c in columns:
+        text = str(c).strip()
+        if re.fullmatch(r"\d{1,2}/\d{1,2}", text):
+            date_cols.append(c)
+    if not date_cols:
+        raise ValueError("Production Schedule khong co cot tuan dang M/D.")
+
+    base_year = report_date.year if report_date is not None else target_week.year
+    # If the first schedule month is much later than target month, it may belong to previous year.
+    first_month = int(str(date_cols[0]).strip().split("/")[0])
+    year = base_year
+    if first_month - target_week.month > 6:
+        year -= 1
+
+    mapping = {}
+    prev_month = None
+    for c in date_cols:
+        m, d = [int(x) for x in str(c).strip().split("/")]
+        if prev_month is not None and m < prev_month:
+            year += 1
+        prev_month = m
+        mapping[date(year, m, d)] = c
+    return mapping
+
+
+
+def find_vendor_col(df: pd.DataFrame) -> Optional[str]:
+    """Find the most likely vendor column in PlanDetailTimeline / PSW exports."""
+    candidates_exact = [
+        "Vendor", "Vendor Code", "VendorCode", "Vendor #", "Vendor#",
+        "Vend", "Vend Code", "Supplier", "Supplier Code", "Mfg Vendor", "MFG Vendor",
+    ]
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for name in candidates_exact:
+        if name.lower() in lower_map:
+            return lower_map[name.lower()]
+    for c in df.columns:
+        text = str(c).strip().lower()
+        if "vendor" in text or "supplier" in text:
+            return c
+    return None
+
+
+def normalize_vendor(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    m = re.match(r'^=\s*"(.*)"$', text)
+    if m:
+        text = m.group(1).strip()
+    text = text.strip().strip('"').strip().upper()
+    if re.fullmatch(r"0*\d+", text):
+        return str(int(text))
+    return text
+
+
+
+
+def vendor_match_key(value) -> str:
+    """Return comparable vendor code. Timeline may show name(code), PSW may show code only."""
+    text = normalize_vendor(value)
+    if not text:
+        return ""
+    paren = re.search(r"\((0*\d+)\)", text)
+    if paren:
+        return str(int(paren.group(1)))
+    nums = re.findall(r"0*\d+", text)
+    if nums:
+        return str(int(nums[-1]))
+    return text
+
+
+def detect_timeline_vendors(plan_csv_path: str) -> pd.DataFrame:
+    """Detect unique vendor order from PlanDetailTimeline for DueDateCalc upload mapping.
+
+    The app uses this list to tell users which DueDateCalc file should correspond
+    to each vendor. Vendor order follows first appearance in the Timeline file.
+    """
+    raw = read_report_csv(plan_csv_path, dtype=str)
+    raw.columns = [str(c).strip() for c in raw.columns]
+    vendor_col = find_vendor_col(raw)
+    if vendor_col is None:
+        return pd.DataFrame(columns=["Vendor Order", "Vendor", "Vendor Code", "Vendor Key", "Rows"])
+
+    tmp = raw.copy()
+    tmp["_vendor"] = tmp[vendor_col].map(normalize_vendor)
+    tmp["_vendor_key"] = tmp["_vendor"].map(vendor_match_key)
+    tmp = tmp[(tmp["_vendor"] != "") & (tmp["_vendor_key"] != "")].copy()
+    if tmp.empty:
+        return pd.DataFrame(columns=["Vendor Order", "Vendor", "Vendor Code", "Vendor Key", "Rows"])
+
+    rows = []
+    seen = set()
+    order = 1
+    for _, r in tmp.iterrows():
+        key = str(r["_vendor_key"]).strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        vendor = str(r["_vendor"]).strip()
+        rows.append({
+            "Vendor Order": order,
+            "Vendor": vendor,
+            "Vendor Code": key,
+            "Vendor Key": key,
+            "Rows": int((tmp["_vendor_key"] == key).sum()),
+        })
+        order += 1
+    return pd.DataFrame(rows)
+
+
+def detect_psw_vendors(psw_csv_paths: List[str]) -> pd.DataFrame:
+    """Detect unique vendor order from PSW / Production Schedule files.
+
+    This is used by the Streamlit UI and backend to map DueDateCalc upload order
+    to vendor-specific transit. Vendor order follows first appearance across the
+    uploaded PSW files. If one PSW file contains multiple vendors, each vendor is
+    listed separately.
+    """
+    rows = []
+    seen = set()
+    order = 1
+    for file_order, path in enumerate(psw_csv_paths or [], start=1):
+        if not path:
+            continue
+        try:
+            raw = read_report_csv(path, dtype=str)
+        except Exception:
+            continue
+        raw.columns = [str(c).strip() for c in raw.columns]
+        vendor_col = find_vendor_col(raw)
+        if vendor_col is None:
+            continue
+        tmp = raw.copy()
+        tmp["_vendor"] = tmp[vendor_col].map(normalize_vendor)
+        tmp["_vendor_key"] = tmp["_vendor"].map(vendor_match_key)
+        tmp = tmp[(tmp["_vendor"] != "") & (tmp["_vendor_key"] != "")].copy()
+        for _, r in tmp.iterrows():
+            key = str(r["_vendor_key"]).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            vendor = str(r["_vendor"]).strip()
+            rows.append({
+                "Vendor Order": order,
+                "Vendor": vendor,
+                "Vendor Code": key,
+                "Vendor Key": key,
+                "Source PSW File Order": file_order,
+                "Rows": int((tmp["_vendor_key"] == key).sum()),
+            })
+            order += 1
+    return pd.DataFrame(rows, columns=["Vendor Order", "Vendor", "Vendor Code", "Vendor Key", "Source PSW File Order", "Rows"])
+
+
+def build_vendor_offset_maps(
+    timeline_vendor_df: pd.DataFrame,
+    due_date_calc_paths: List[str],
+    offset_mode: str = "legacy_compatible",
+) -> Tuple[Dict[str, Dict[str, int]], pd.DataFrame]:
+    """Build vendor -> warehouse offset map from DueDateCalc upload order.
+
+    Rules:
+    - If only one DueDateCalc file is uploaded, all vendors use that file.
+    - If multiple files are uploaded, file order follows the detected PSW vendor order.
+    - If fewer files than vendors are uploaded, the last uploaded file is reused as fallback.
+    """
+    due_paths = [p for p in (due_date_calc_paths or []) if p]
+    vendor_maps: Dict[str, Dict[str, int]] = {}
+    debug_rows = []
+
+    if timeline_vendor_df is None or timeline_vendor_df.empty:
+        return vendor_maps, pd.DataFrame([
+            ["Vendor DueDate mapping", "No vendor detected from PSW; default DueDateCalc will be used"]
+        ], columns=["Field", "Value"])
+
+    if not due_paths:
+        return vendor_maps, pd.DataFrame([
+            ["Vendor DueDate mapping", "No DueDateCalc files provided for vendor mapping"]
+        ], columns=["Field", "Value"])
+
+    cache: Dict[str, Dict[str, int]] = {}
+    for _, r in timeline_vendor_df.iterrows():
+        vendor_key = str(r.get("Vendor Key") or r.get("Vendor Code") or "").strip()
+        vendor = str(r.get("Vendor", vendor_key)).strip()
+        order_val = int(r.get("Vendor Order", 1)) if str(r.get("Vendor Order", "")).strip() else 1
+        due_idx = min(max(order_val - 1, 0), len(due_paths) - 1)
+        due_path = due_paths[due_idx]
+
+        if due_path not in cache:
+            cache[due_path], _ = load_due_date_offsets(due_path, offset_mode=offset_mode)
+        vendor_maps[vendor_key] = cache[due_path]
+        debug_rows.append({
+            "Vendor Order": order_val,
+            "Vendor": vendor,
+            "Vendor Code": vendor_key,
+            "DueDateCalc Used": os.path.basename(due_path),
+            "Mapping Rule": "same file for all vendors" if len(due_paths) == 1 else ("upload-order match" if order_val <= len(due_paths) else "last-file fallback"),
+        })
+
+    return vendor_maps, pd.DataFrame(debug_rows)
+
+
+def find_transit_weeks_in_row(row: pd.Series, default_weeks: int) -> int:
+    """
+    Optional vendor-specific transit support.
+    If a PSW/export row contains Transit Weeks, Transit Days, Delivery Days, or Lead Time columns,
+    use that value. Otherwise fall back to the warehouse offset from DueDateCalc/legacy mapping.
+    """
+    week_keywords = ["transit week", "delivery week", "lead week", "offset week"]
+    day_keywords = ["transit day", "delivery day", "lead day"]
+    for c in row.index:
+        name = str(c).strip().lower()
+        if any(k in name for k in week_keywords):
+            val = pd.to_numeric(row.get(c), errors="coerce")
+            if pd.notna(val):
+                return max(0, int(math.ceil(float(val))))
+    for c in row.index:
+        name = str(c).strip().lower()
+        if any(k in name for k in day_keywords):
+            val = pd.to_numeric(row.get(c), errors="coerce")
+            if pd.notna(val):
+                return max(0, int(math.ceil(float(val) / 7.0)))
+    return int(default_weeks)
+
+
+def load_psw_vendor_supply(
+    psw_csv_paths: List[str],
+    target_week: date,
+    current_week: date,
+    offset_map: Dict[str, int],
+    other_vendor_offset_map: Optional[Dict[str, int]] = None,
+    vendor_offset_maps: Optional[Dict[str, Dict[str, int]]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Read one or more PSW / Production Schedule CSV files and return vendor-level F rows by week.
+
+    PSW week is ETD. PlanDetailTimeline week is ETA. Adjusted Supply Week is kept for audit:
+      Adjusted Supply Week = PSW ETD Week + Vendor Transit Weeks - Warehouse Offset Weeks
+
+    If no vendor-specific transit column exists in PSW:
+      - first PSW file uses the main/default DueDateCalc transit by warehouse;
+      - second/subsequent PSW files use the optional sub-vendor DueDateCalc transit by warehouse;
+      - if no sub-vendor DueDateCalc is provided, sub vendors fall back to the main/default transit.
+
+    Warehouse Offset Weeks is always the main/default PlanDetailTimeline offset basis.
+    Vendor Transit Weeks may differ by upload order, so sub-vendor supply can shift into an adjusted week.
+    """
+    if other_vendor_offset_map is None:
+        other_vendor_offset_map = offset_map
+    vendor_offset_maps = vendor_offset_maps or {}
+
+    def _vendor_specific_transit(row, fallback_weeks):
+        wh = normalize_whse(row.get("Whse", ""))
+        vk = vendor_match_key(row.get("Vendor", ""))
+        if vk in vendor_offset_maps and wh in vendor_offset_maps[vk]:
+            return int(vendor_offset_maps[vk][wh])
+        return int(fallback_weeks)
+
+    detail_frames = []
+    debug_rows = []
+    for file_order, path in enumerate(psw_csv_paths or [], start=1):
+        if not path:
+            continue
+        source_vendor_role = "MAIN_FILE" if file_order == 1 else "OTHER_FILE"
+        prod = read_report_csv(path, dtype=str)
+        prod.columns = [str(c).strip() for c in prod.columns]
+        required = ["Item #", "Whse", "S/F/P"]
+        missing = [c for c in required if c not in prod.columns]
+        if missing:
+            raise ValueError(f"PSW/Production Schedule thieu cot {missing}: {path}")
+        vendor_col = find_vendor_col(prod)
+        if vendor_col is None:
+            # Keep the flow working; vendor will be blank and all supply falls back to legacy item+whse logic.
+            prod["Vendor"] = ""
+            vendor_col = "Vendor"
+
+        report_dt = extract_report_date_from_csv(path)
+        date_map = build_production_date_map(prod.columns, report_dt, target_week)
+        week_cols = sorted(date_map.items(), key=lambda x: x[0])
+
+        prod = prod.copy()
+        prod["Item"] = prod["Item #"].map(normalize_item)
+        prod["Whse"] = prod["Whse"].map(normalize_whse)
+        prod["Vendor"] = prod[vendor_col].map(normalize_vendor)
+        prod["S/F/P"] = prod["S/F/P"].fillna("").astype(str).str.strip().str.upper()
+        f = prod[prod["S/F/P"] == "F"].copy()
+
+        rows = []
+        for wk, col in week_cols:
+            qty = pd.to_numeric(f[col], errors="coerce").fillna(0.0)
+            nonzero = f.loc[qty != 0].copy()
+            if nonzero.empty:
+                continue
+            nonzero["PSW Week"] = wk
+            nonzero["PSW Week Text"] = fmt_date(wk)
+            nonzero["PSW Quantity"] = qty.loc[qty != 0].values
+            # Warehouse Offset Weeks is the PlanDetailTimeline/default ETD basis.
+            nonzero["Warehouse Offset Weeks"] = nonzero["Whse"].map(offset_map).fillna(0).astype(int)
+
+            # Keep both main/default and sub/other transit candidates.
+            # The final vendor role is decided after matching to PlanDetailTimeline vendor.
+            # This is important when one PSW file contains both main and sub vendors.
+            nonzero["Main Default Vendor Transit Weeks"] = nonzero["Whse"].map(offset_map).fillna(nonzero["Warehouse Offset Weeks"]).astype(int)
+            nonzero["Sub Default Vendor Transit Weeks"] = nonzero["Whse"].map(other_vendor_offset_map).fillna(nonzero["Main Default Vendor Transit Weeks"]).astype(int)
+
+            # Temporary values for audit before role split; split_main_other_vendor_supply recomputes these
+            # using final MAIN vs OTHER role, but vendor-specific DueDateCalc is already available here.
+            initial_transit_map = offset_map if file_order == 1 else other_vendor_offset_map
+            nonzero["Default Vendor Transit Weeks"] = nonzero["Whse"].map(initial_transit_map).fillna(nonzero["Warehouse Offset Weeks"]).astype(int)
+            nonzero["Vendor Specific DueDateCalc Transit Weeks"] = [
+                _vendor_specific_transit(r, int(r["Default Vendor Transit Weeks"])) for _, r in nonzero.iterrows()
+            ]
+            nonzero["Vendor Transit Source"] = "Vendor-specific DueDateCalc by PSW vendor order"
+            nonzero["Vendor Transit Weeks"] = [
+                find_transit_weeks_in_row(r, int(r["Vendor Specific DueDateCalc Transit Weeks"])) for _, r in nonzero.iterrows()
+            ]
+            nonzero["Adjusted Supply Week"] = [
+                wk + timedelta(days=7 * (int(vt) - int(wo)))
+                for vt, wo in zip(nonzero["Vendor Transit Weeks"], nonzero["Warehouse Offset Weeks"])
+            ]
+            nonzero["Adjusted Supply Week Text"] = nonzero["Adjusted Supply Week"].map(fmt_date)
+            nonzero["Source File"] = os.path.basename(path)
+            nonzero["Source File Order"] = file_order
+            nonzero["Source Vendor Role"] = source_vendor_role
+            rows.append(nonzero[[
+                "Source File", "Source File Order", "Source Vendor Role", "Item", "Whse", "Vendor", "PSW Week", "PSW Week Text", "PSW Quantity",
+                "Vendor Transit Source", "Default Vendor Transit Weeks", "Main Default Vendor Transit Weeks", "Sub Default Vendor Transit Weeks", "Vendor Specific DueDateCalc Transit Weeks", "Vendor Transit Weeks", "Warehouse Offset Weeks", "Adjusted Supply Week", "Adjusted Supply Week Text"
+            ]])
+        detail = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=[
+            "Source File", "Source File Order", "Source Vendor Role", "Item", "Whse", "Vendor", "PSW Week", "PSW Week Text", "PSW Quantity",
+            "Vendor Transit Source", "Default Vendor Transit Weeks", "Vendor Transit Weeks", "Warehouse Offset Weeks", "Adjusted Supply Week", "Adjusted Supply Week Text"
+        ])
+        detail_frames.append(detail)
+        debug_rows.extend([
+            [os.path.basename(path), "Source file order", file_order],
+            [os.path.basename(path), "Source vendor role from upload order", source_vendor_role],
+            [os.path.basename(path), "Rows", len(prod)],
+            [os.path.basename(path), "F rows", len(f)],
+            [os.path.basename(path), "Vendor column", vendor_col],
+            [os.path.basename(path), "Week columns", len(week_cols)],
+            [os.path.basename(path), "Nonzero F vendor-week rows", len(detail)],
+            [os.path.basename(path), "Total nonzero F quantity", float(detail["PSW Quantity"].sum()) if not detail.empty else 0.0],
+        ])
+    all_detail = pd.concat(detail_frames, ignore_index=True) if detail_frames else pd.DataFrame(columns=[
+        "Source File", "Source File Order", "Source Vendor Role", "Item", "Whse", "Vendor", "PSW Week", "PSW Week Text", "PSW Quantity",
+        "Vendor Transit Source", "Default Vendor Transit Weeks", "Vendor Transit Weeks", "Warehouse Offset Weeks", "Adjusted Supply Week", "Adjusted Supply Week Text"
+    ])
+    debug = pd.DataFrame(debug_rows, columns=["Source File", "Field", "Value"])
+    if debug.empty:
+        debug = pd.DataFrame([["", "PSW files", 0]], columns=["Source File", "Field", "Value"])
+    return all_detail, debug
+
+
+def split_main_other_vendor_supply(
+    base_rows: pd.DataFrame,
+    psw_detail: pd.DataFrame,
+    target_week: date,
+    current_week: date,
+    vendor_offset_maps: Optional[Dict[str, Dict[str, int]]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Split PSW supply into main-vendor and other-vendor buckets.
+    Preferred rule: upload order decides role (1st PSW = main vendor, 2nd+ PSW = other vendor).
+    Fallback rule: if upload-order role is unavailable, compare PSW vendor to PlanDetailTimeline vendor.
+    - Main vendor: only Target Week quantity becomes F Wk3 for optimizer allocation.
+    - Other vendor: uses the same Target Week PSW F logic as main vendor for subvendor suggestion; SI baseline is main-vendor SI After.
+    """
+    vendor_offset_maps = vendor_offset_maps or {}
+    base = base_rows[["Item", "Whse", "Vendor"]].copy()
+    base["Item"] = base["Item"].map(normalize_item)
+    base["Whse"] = base["Whse"].map(normalize_whse)
+    base["Main Vendor"] = base["Vendor"].map(normalize_vendor)
+    main_map = base.groupby(["Item", "Whse"], dropna=False)["Main Vendor"].first().reset_index()
+
+    if psw_detail is None or psw_detail.empty:
+        empty_group = base[["Item", "Whse"]].drop_duplicates().copy()
+        empty_group["Main Vendor F Wk3"] = 0.0
+        empty_group["Other Vendor Supply"] = 0.0
+        empty_group["Other Vendor List"] = ""
+        empty_group["Total Supply Added to SI"] = 0.0
+        return empty_group, pd.DataFrame(), pd.DataFrame()
+
+    detail = psw_detail.copy()
+    detail["Item"] = detail["Item"].map(normalize_item)
+    detail["Whse"] = detail["Whse"].map(normalize_whse)
+    detail["Vendor"] = detail["Vendor"].map(normalize_vendor)
+    detail = detail.merge(main_map, on=["Item", "Whse"], how="left")
+
+    # Vendor role rule:
+    #   - If PSW vendor matches PlanDetailTimeline vendor, treat it as MAIN.
+    #   - If PSW vendor does not match Timeline vendor, treat it as OTHER, even when it is in the first uploaded PSW file.
+    #   - If the row comes from a second/subsequent PSW file, keep it as OTHER.
+    # This handles the common case where one PSW file contains both the main vendor and sub vendor.
+    has_source_role = "Source Vendor Role" in detail.columns and detail["Source Vendor Role"].fillna("").astype(str).str.strip().ne("").any()
+    def _decide_vendor_role(r):
+        source_role = str(r.get("Source Vendor Role", "")).upper().strip()
+        psw_vendor_key = vendor_match_key(r.get("Vendor"))
+        main_vendor_key = vendor_match_key(r.get("Main Vendor"))
+        if has_source_role and source_role != "MAIN_FILE":
+            return "OTHER"
+        if main_vendor_key:
+            return "MAIN" if psw_vendor_key == main_vendor_key else "OTHER"
+        # Backward compatibility: if Timeline vendor is blank, first uploaded PSW file is main; later files are other.
+        return "MAIN" if (not has_source_role or source_role == "MAIN_FILE") else "OTHER"
+
+    detail["Vendor Role"] = detail.apply(_decide_vendor_role, axis=1)
+
+    # Recompute transit/adjusted week after final role split.
+    # MAIN rows use main/default DueDateCalc; OTHER rows use sub/other DueDateCalc if uploaded.
+    if "Main Default Vendor Transit Weeks" not in detail.columns:
+        detail["Main Default Vendor Transit Weeks"] = detail["Default Vendor Transit Weeks"]
+    if "Sub Default Vendor Transit Weeks" not in detail.columns:
+        detail["Sub Default Vendor Transit Weeks"] = detail["Default Vendor Transit Weeks"]
+    detail["Default Vendor Transit Weeks"] = detail.apply(
+        lambda r: r["Main Default Vendor Transit Weeks"] if r["Vendor Role"] == "MAIN" else r["Sub Default Vendor Transit Weeks"],
+        axis=1,
+    )
+
+    def _role_vendor_transit(row):
+        wh = normalize_whse(row.get("Whse", ""))
+        vk = vendor_match_key(row.get("Vendor", ""))
+        if vk in vendor_offset_maps and wh in vendor_offset_maps[vk]:
+            return int(vendor_offset_maps[vk][wh]), "Vendor-specific DueDateCalc by PSW vendor order"
+        return int(row["Default Vendor Transit Weeks"]), ("Main DueDateCalc fallback" if row["Vendor Role"] == "MAIN" else "Sub/default DueDateCalc fallback")
+
+    _vt_pairs = [_role_vendor_transit(r) for _, r in detail.iterrows()]
+    detail["Vendor Specific DueDateCalc Transit Weeks"] = [p[0] for p in _vt_pairs]
+    detail["Vendor Transit Source"] = [p[1] for p in _vt_pairs]
+    detail["Vendor Transit Weeks"] = [
+        find_transit_weeks_in_row(r, int(r["Vendor Specific DueDateCalc Transit Weeks"])) for _, r in detail.iterrows()
+    ]
+    detail["Adjusted Supply Week"] = [
+        pd.to_datetime(wk).date() + timedelta(days=7 * (int(vt) - int(wo)))
+        for wk, vt, wo in zip(detail["PSW Week"], detail["Vendor Transit Weeks"], detail["Warehouse Offset Weeks"])
+    ]
+    detail["Adjusted Supply Week Text"] = detail["Adjusted Supply Week"].map(fmt_date)
+
+    detail["Included as Main F Wk3"] = (detail["Vendor Role"] == "MAIN") & (detail["PSW Week"] == target_week)
+
+    # Sub/other vendor must follow the same week logic as the main vendor.
+    # The only difference is the SI baseline used later: subvendor DC starts from main-vendor SI After.
+    # Therefore subvendor F Original / Other Vendor Supply is also PSW F at Target Week,
+    # not Adjusted Supply Week and not Current Week -> Target Week window.
+    detail["Included as Other F Wk3"] = (detail["Vendor Role"] == "OTHER") & (detail["PSW Week"] == target_week)
+    detail["Included as Other Supply"] = detail["Included as Other F Wk3"]
+
+    detail["Inclusion Reason"] = "Not included"
+    detail.loc[detail["Included as Main F Wk3"], "Inclusion Reason"] = "Main vendor, PSW ETD week = Target Week; used as F Wk3 for optimizer"
+    detail.loc[detail["Included as Other Supply"], "Inclusion Reason"] = "Other vendor, PSW ETD week = Target Week; used as subvendor F suggestion and SI/SS supply only"
+
+    main = detail[detail["Included as Main F Wk3"]].groupby(["Item", "Whse"], dropna=False, as_index=False)["PSW Quantity"].sum().rename(columns={"PSW Quantity": "Main Vendor F Wk3"})
+    other_qty = detail[detail["Included as Other Supply"]].groupby(["Item", "Whse"], dropna=False, as_index=False)["PSW Quantity"].sum().rename(columns={"PSW Quantity": "Other Vendor Supply"})
+
+    # Show the other/sub vendor code on every warehouse row of the same item for easier filtering/debugging.
+    # Quantity is still counted only on rows where the other vendor has PSW F at Target Week.
+    item_other_list = (
+        detail[detail["Vendor Role"] == "OTHER"]
+        .groupby(["Item"], dropna=False)["Vendor"]
+        .agg(lambda x: ", ".join(sorted({str(v).strip() for v in x if str(v).strip() and str(v).strip().lower() != "nan"})))
+        .reset_index()
+        .rename(columns={"Vendor": "Other Vendor List"})
+    )
+
+    grouped = (
+        base[["Item", "Whse", "Main Vendor"]].drop_duplicates()
+        .merge(main, on=["Item", "Whse"], how="left")
+        .merge(other_qty, on=["Item", "Whse"], how="left")
+        .merge(item_other_list, on=["Item"], how="left")
+    )
+    grouped["Main Vendor F Wk3"] = pd.to_numeric(grouped["Main Vendor F Wk3"], errors="coerce").fillna(0.0)
+    grouped["Other Vendor Supply"] = pd.to_numeric(grouped["Other Vendor Supply"], errors="coerce").fillna(0.0)
+    grouped["Other Vendor List"] = grouped["Other Vendor List"].fillna("")
+    # Initial PSW supply only. Final Total Supply Added to SI is recomputed after Timeline Firm PO is available
+    # as Main Vendor F Wk3 + Other Vendor Supply + Firm PO Reconciliation Gap.
+    grouped["PSW F Used for Reconciliation"] = grouped["Main Vendor F Wk3"] + grouped["Other Vendor Supply"]
+    grouped["Total Supply Added to SI"] = grouped["PSW F Used for Reconciliation"]
+
+    supply_debug = pd.DataFrame([
+        ["PSW vendor rows", len(detail)],
+        ["Main vendor rows included as F Wk3", int(detail["Included as Main F Wk3"].sum())],
+        ["Other vendor rows included as SI/SS supply", int(detail["Included as Other Supply"].sum())],
+        ["Main Vendor F Wk3 total", float(grouped["Main Vendor F Wk3"].sum())],
+        ["Other Vendor Supply total", float(grouped["Other Vendor Supply"].sum())],
+        ["Total Supply Added to SI", float(grouped["Total Supply Added to SI"].sum())],
+        ["PSW role rule", "Vendor match to PlanDetailTimeline decides MAIN vs OTHER inside each PSW file; second/subsequent PSW files are forced OTHER"],
+        ["Other vendor inclusion rule", "Same as main vendor: PSW ETD week = Target Week. Adjusted Supply Week is audit only."],
+    ], columns=["Field", "Value"])
+    return grouped, detail, supply_debug
+
+def load_fwk3_from_production(production_csv_path: str, target_week: date) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    prod = read_report_csv(production_csv_path, dtype=str)
+    prod.columns = [str(c).strip() for c in prod.columns]
+    required = ["Item #", "Whse", "S/F/P"]
+    missing = [c for c in required if c not in prod.columns]
+    if missing:
+        raise ValueError(f"Production Schedule thieu cot: {missing}")
+
+    report_dt = extract_report_date_from_csv(production_csv_path)
+    date_map = build_production_date_map(prod.columns, report_dt, target_week)
+    week_col = date_map.get(target_week)
+    if week_col is None:
+        available = ", ".join(fmt_date(d) for d in sorted(date_map.keys())[:5]) + " ... " + ", ".join(fmt_date(d) for d in sorted(date_map.keys())[-5:])
+        raise ValueError(f"Production Schedule khong co cot target week {fmt_date(target_week)}. Available: {available}")
+
+    prod = prod.copy()
+    prod["Item"] = prod["Item #"].map(normalize_item)
+    prod["Whse"] = prod["Whse"].map(normalize_whse)
+    prod["S/F/P"] = prod["S/F/P"].fillna("").astype(str).str.strip().str.upper()
+    prod["F Wk3"] = pd.to_numeric(prod[week_col], errors="coerce").fillna(0.0)
+
+    f = prod[prod["S/F/P"] == "F"].copy()
+    grouped = f.groupby(["Item", "Whse"], dropna=False, as_index=False)["F Wk3"].sum()
+
+    debug = pd.DataFrame([
+        ["Production rows", len(prod)],
+        ["Production F rows", len(f)],
+        ["Production report date", str(report_dt) if report_dt else ""],
+        ["TargetWeek", fmt_date(target_week)],
+        ["Production target column", week_col],
+        ["F Wk3 total", float(grouped["F Wk3"].sum())],
+        ["F Wk3 nonzero item-whse", int((grouped["F Wk3"] != 0).sum())],
+    ], columns=["Field", "Value"])
+    return grouped, debug
+
+
+
+
+def build_optimizer_input_direct_from_plan(
+    plan_csv_path: str,
+    offset_map: Dict[str, int],
+    f_wk3: pd.DataFrame,
+    target_week: date,
+    current_week: date,
+    psw_supply_detail: Optional[pd.DataFrame] = None,
+    vendor_offset_maps: Optional[Dict[str, Dict[str, int]]] = None,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Fast path: compute optimizer input directly from raw PlanDetailTimeline without materializing 44-week converted file."""
+    raw = read_report_csv(plan_csv_path, dtype=str)
+    raw.columns = [str(c).strip() for c in raw.columns]
+    required_base = ["Item #", "Whse", "Data Type", "Coll. Class", "MakeBuy Code"]
+    missing = [c for c in required_base if c not in raw.columns]
+    if missing:
+        raise ValueError(f"PlanDetailTimeline thieu cot: {missing}")
+
+    raw = raw.copy()
+    raw["Item #"] = raw["Item #"].map(normalize_item)
+    raw["Whse"] = raw["Whse"].map(normalize_whse)
+    raw["Data Type"] = clean_dtype(raw["Data Type"])
+    raw["MakeBuy Code"] = raw["MakeBuy Code"].fillna("").astype(str).str.strip().str.upper()
+    raw["Coll. Class"] = raw["Coll. Class"].fillna("").astype(str).str.strip()
+
+    timeline_vendor_col = find_vendor_col(raw)
+    if timeline_vendor_col:
+        raw["_timeline_vendor"] = raw[timeline_vendor_col].map(normalize_vendor)
+        raw["_timeline_vendor_key"] = raw["_timeline_vendor"].map(vendor_match_key)
+    else:
+        raw["_timeline_vendor"] = ""
+        raw["_timeline_vendor_key"] = ""
+
+    # Robustly detect weekly date columns by header value.
+    # Do not rely on fixed column positions because PlanDetailTimeline exports may
+    # include a different number of trailing attributes.
+    date_cols = []
+    date_map = {}
+    for c in raw.columns:
+        d = parse_header_to_date(c)
+        if d is not None:
+            date_cols.append(c)
+            date_map[d] = c
+    if not date_cols:
+        raise ValueError("PlanDetailTimeline khong co cot ngay tuan o vi tri expected.")
+    original_dates = sorted(date_map.keys())
+    first_original_week = min(original_dates)
+    last_original_week = max(original_dates)
+    first_etd_week = first_original_week - timedelta(days=154)
+
+    raw = raw[raw["MakeBuy Code"] == "B"].copy()
+    if raw.empty:
+        raise ValueError("Khong co dong du lieu nao sau khi loc MakeBuy Code = B.")
+
+    raw["_target_value"] = 0.0
+    raw["_planned_sum"] = 0.0
+    raw["_net_sum"] = 0.0
+
+    vendor_offset_maps = vendor_offset_maps or {}
+    def _offset_for_row(row):
+        wh = normalize_whse(row.get("Whse", ""))
+        vk = str(row.get("_timeline_vendor_key", "")).strip()
+        if vk in vendor_offset_maps and wh in vendor_offset_maps[vk]:
+            return int(vendor_offset_maps[vk][wh])
+        return int(offset_map.get(wh, 0))
+
+    raw["_offset_weeks"] = raw.apply(_offset_for_row, axis=1).astype(int)
+    raw["_offset_source"] = raw.apply(
+        lambda r: f"Vendor DueDateCalc {r.get('_timeline_vendor_key','')}"
+        if str(r.get("_timeline_vendor_key", "")).strip() in vendor_offset_maps
+        else "Default DueDateCalc",
+        axis=1,
+    )
+    unknown_whse = sorted(set(raw.loc[~raw["Whse"].isin(offset_map.keys()), "Whse"].dropna().astype(str)))
+
+    planned_etd_weeks = date_range_saturdays(first_etd_week, target_week)
+    net_etd_weeks = date_range_saturdays(current_week, target_week)
+    if current_week > target_week:
+        raise ValueError("Target Week phai lon hon hoac bang Current Week.")
+
+    # Process by offset instead of by row, much faster.
+    for offset, idx in raw.groupby("_offset_weeks", sort=False).groups.items():
+        target_src = target_week + timedelta(days=7 * int(offset))
+        target_col = date_map.get(target_src)
+        if target_col:
+            raw.loc[idx, "_target_value"] = pd.to_numeric(raw.loc[idx, target_col], errors="coerce").fillna(0.0).values
+
+        planned_cols = [date_map[d + timedelta(days=7 * int(offset))] for d in planned_etd_weeks if (d + timedelta(days=7 * int(offset))) in date_map]
+        if planned_cols:
+            raw.loc[idx, "_planned_sum"] = raw.loc[idx, planned_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1).values
+
+        net_cols = [date_map[d + timedelta(days=7 * int(offset))] for d in net_etd_weeks if (d + timedelta(days=7 * int(offset))) in date_map]
+        if net_cols:
+            raw.loc[idx, "_net_sum"] = raw.loc[idx, net_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1).values
+
+    key_cols = ["Item #", "Whse", "Coll. Class"]
+    si_g = group_value(raw[raw["Data Type"] == "SHIPPABLE INV"], key_cols, "_target_value", "Base_SI")
+    planned_g = group_value(raw[raw["Data Type"] == "PLANNED POS"], key_cols, "_planned_sum", "PlannedPO_Sum")
+    firm_g = group_value(raw[raw["Data Type"] == "FIRM POS"], key_cols, "_target_value", "FirmPO_Target")
+    net_g = group_value(raw[raw["Data Type"] == "NET FCST"], key_cols, "_net_sum", "NetFcst_Sum")
+    ss_g = group_value(raw[raw["Data Type"] == "SAFETY STK"], key_cols, "_target_value", "SS_Wk3")
+
+    base = raw[raw["Data Type"].isin(["SHIPPABLE INV", "PLANNED POS", "FIRM POS", "NET FCST", "SAFETY STK"])][key_cols].drop_duplicates()
+    out = base.merge(si_g, on=key_cols, how="left").merge(planned_g, on=key_cols, how="left").merge(firm_g, on=key_cols, how="left").merge(net_g, on=key_cols, how="left").merge(ss_g, on=key_cols, how="left")
+    for col in ["Base_SI", "PlannedPO_Sum", "FirmPO_Target", "NetFcst_Sum", "SS_Wk3"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    # Timeline Firm PO at the mapped ETA week. It is kept for reconciliation because
+    # Current SI has already subtracted this Firm PO amount from PlanDetailTimeline.
+    out["Timeline Firm PO"] = out["FirmPO_Target"]
+
+    out["F Wk3"] = 0.0
+    # SI logic applies the same formula for all warehouses, including Whse 335.
+    # Net Forecast is no longer added for Whse 335.
+    out["Sum of SI Wk3"] = out["Base_SI"] - out["PlannedPO_Sum"] - out["FirmPO_Target"]
+    out["Sum of SI-SS Wk3"] = out["Sum of SI Wk3"] - out["SS_Wk3"]
+    out["Average of SS Wk3"] = out["SS_Wk3"]
+
+    vendor_col = next((c for c in raw.columns if c.lower() == "vendor"), None)
+    if vendor_col:
+        vendor_map = raw.groupby(key_cols, dropna=False)[vendor_col].first().reset_index().rename(columns={vendor_col: "Vendor"})
+        out = out.merge(vendor_map, on=key_cols, how="left")
+    else:
+        out["Vendor"] = ""
+
+    out = out.rename(columns={"Item #": "Item", "Coll. Class": "ProdResourceID"})
+    out["Item"] = out["Item"].map(normalize_item)
+    out["Whse"] = out["Whse"].map(normalize_whse)
+
+    # Multi-vendor PSW logic.
+    # Vendor matching rule:
+    #   PSW Vendor == Timeline Vendor -> main vendor. Main vendor Target Week quantity becomes F Wk3.
+    #   PSW Vendor != Timeline Vendor -> other vendor. Other vendor quantity updates SI/SS only, not F Wk3 allocation.
+    if psw_supply_detail is not None and not psw_supply_detail.empty:
+        supply_grouped, psw_vendor_detail, psw_supply_debug = split_main_other_vendor_supply(
+            out[["Item", "Whse", "Vendor"]].drop_duplicates(), psw_supply_detail, target_week, current_week,
+            vendor_offset_maps=vendor_offset_maps,
+        )
+        out = out.merge(supply_grouped, on=["Item", "Whse"], how="left")
+        out["Main Vendor"] = out["Main Vendor"].fillna(out["Vendor"].map(normalize_vendor))
+        out["Main Vendor F Wk3"] = pd.to_numeric(out["Main Vendor F Wk3"], errors="coerce").fillna(0.0)
+        out["Other Vendor Supply"] = pd.to_numeric(out["Other Vendor Supply"], errors="coerce").fillna(0.0)
+        out["Other Vendor List"] = out["Other Vendor List"].fillna("")
+        out["PSW F Used for Reconciliation"] = out["Main Vendor F Wk3"] + out["Other Vendor Supply"]
+        # Firm PO Reconciliation Gap = Timeline Firm PO at mapped ETA week - PSW F around mapped ETD bucket.
+        # This gap is added back to New SI / New SI-SS because Timeline Current SI already used Timeline Firm PO.
+        out["Firm PO Reconciliation Gap"] = out["Timeline Firm PO"] - out["PSW F Used for Reconciliation"]
+        out["Total Supply Added to SI"] = (
+            out["Main Vendor F Wk3"] + out["Other Vendor Supply"] + out["Firm PO Reconciliation Gap"]
+        )
+        out["F Wk3"] = out["Main Vendor F Wk3"]
+        f_for_missing = supply_grouped[["Item", "Whse", "Main Vendor F Wk3"]].rename(columns={"Main Vendor F Wk3": "F Wk3"})
+    else:
+        psw_vendor_detail = pd.DataFrame()
+        psw_supply_debug = pd.DataFrame([["PSW vendor detail", "Not provided; using legacy item+whse F Wk3"]], columns=["Field", "Value"])
+        f_wk3 = f_wk3.copy()
+        f_wk3["Item"] = f_wk3["Item"].map(normalize_item)
+        f_wk3["Whse"] = f_wk3["Whse"].map(normalize_whse)
+        out = out.merge(f_wk3, on=["Item", "Whse"], how="left", suffixes=("", "_from_prod"))
+        out["F Wk3"] = pd.to_numeric(out["F Wk3_from_prod"], errors="coerce").fillna(0.0)
+        out = out.drop(columns=["F Wk3_from_prod"])
+        out["Main Vendor"] = out["Vendor"].map(normalize_vendor)
+        out["Main Vendor F Wk3"] = out["F Wk3"]
+        out["Other Vendor Supply"] = 0.0
+        out["Other Vendor List"] = ""
+        out["PSW F Used for Reconciliation"] = out["Main Vendor F Wk3"] + out["Other Vendor Supply"]
+        out["Firm PO Reconciliation Gap"] = out["Timeline Firm PO"] - out["PSW F Used for Reconciliation"]
+        out["Total Supply Added to SI"] = (
+            out["Main Vendor F Wk3"] + out["Other Vendor Supply"] + out["Firm PO Reconciliation Gap"]
+        )
+        f_for_missing = f_wk3
+
+    output_cols = [c for c in OUTPUT_COLUMNS if c in out.columns]
+    output = out[output_cols].drop_duplicates().copy()
+
+    merge_debug = output.merge(f_for_missing, on=["Item", "Whse"], how="left", indicator=True, suffixes=("", "_prod"))
+    missing_f = merge_debug[merge_debug["_merge"] == "left_only"][["Item", "Whse", "ProdResourceID"]].drop_duplicates()
+
+    build_debug = pd.DataFrame([
+        ["Plan rows after MakeBuy B", len(raw)],
+        ["Original first ETA week", fmt_date(first_original_week)],
+        ["Original last ETA week", fmt_date(last_original_week)],
+        ["First converted ETD week", fmt_date(first_etd_week)],
+        ["TargetWeek", fmt_date(target_week)],
+        ["CurrentWeek", fmt_date(current_week)],
+        ["Planned POS ETD range", ", ".join(fmt_date(d) for d in planned_etd_weeks)],
+        ["NET FCST ETD range", ", ".join(fmt_date(d) for d in net_etd_weeks)],
+        ["F Wk3 source", "PSW/Production Schedule: S/F/P = F, main vendor only, Target Week only"],
+        ["Other Vendor Supply source", "PSW vendor different from Timeline vendor; adjusted supply week between Current Week and Target Week"],
+        ["Rows output", str(len(output))],
+        ["Rows without Production F match", str(len(missing_f))],
+        ["F Wk3 total in optimizer input", str(float(output["F Wk3"].sum()))],
+        ["Other Vendor Supply total", str(float(output["Other Vendor Supply"].sum())) if "Other Vendor Supply" in output.columns else "0"],
+        ["Firm PO Reconciliation Gap total", str(float(output["Firm PO Reconciliation Gap"].sum())) if "Firm PO Reconciliation Gap" in output.columns else "0"],
+        ["Total Supply Added to SI", str(float(output["Total Supply Added to SI"].sum())) if "Total Supply Added to SI" in output.columns else str(float(output["F Wk3"].sum()))],
+        ["Unknown Whse count", len(unknown_whse)],
+        ["Unknown Whse list", ", ".join(unknown_whse)],
+        ["Whse 335 SI logic", "Same as other warehouses: SI(Target Week) - Planned POS(First ETD week -> Target Week) - Firm POS(Target Week). Net Forecast is not added."],
+        ["Other Whse SI logic", "SI(Target Week) - Planned POS(First ETD week -> Target Week) - Firm POS(Target Week)"],
+    ], columns=["Field", "Value"])
+
+    offset_by_whse = raw[["Whse", "_timeline_vendor", "_timeline_vendor_key", "_offset_weeks", "_offset_source"]].drop_duplicates().rename(columns={"_timeline_vendor": "Timeline Vendor", "_timeline_vendor_key": "Vendor Code", "_offset_weeks": "Used Offset Weeks", "_offset_source": "Offset Source"}).sort_values(["Whse", "Vendor Code"])
+    return output, build_debug, missing_f, offset_by_whse, psw_vendor_detail, psw_supply_debug
+
+
+# ============================================================
+# Step 4: Build optimizer input from converted PlanDetailTimeline
+# ============================================================
+
+def transform_converted_plan_to_optimizer_input(
+    converted: pd.DataFrame,
+    f_wk3: pd.DataFrame,
+    target_week: date,
+    current_week: date,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    raw = converted.copy()
+    raw.columns = [str(c).strip() for c in raw.columns]
+
+    required_base = ["Item #", "Whse", "Data Type", "Coll. Class", "MakeBuy Code"]
+    missing_base = [c for c in required_base if c not in raw.columns]
+    if missing_base:
+        raise ValueError(f"Thieu cot bat buoc trong Plan converted: {', '.join(missing_base)}")
+
+    raw["Data Type"] = clean_dtype(raw["Data Type"])
+    raw["MakeBuy Code"] = raw["MakeBuy Code"].fillna("").astype(str).str.strip().str.upper()
+    raw["Item #"] = raw["Item #"].map(normalize_item)
+    raw["Whse"] = raw["Whse"].map(normalize_whse)
+    raw["Coll. Class"] = raw["Coll. Class"].fillna("").astype(str).str.strip()
+
+    vendor_col = next((c for c in raw.columns if c.lower() == "vendor"), None)
+
+    raw = raw[raw["MakeBuy Code"] == "B"].copy()
+    if raw.empty:
+        raise ValueError("Khong co dong du lieu nao sau khi loc MakeBuy Code = B.")
+
+    date_col_map = build_date_column_map(raw)
+    target_col = date_col_map.get(target_week)
+    if target_col is None:
+        raise ValueError(f"Khong tim thay cot Target Week trong Plan converted: {fmt_date(target_week)}")
+
+    all_week_dates = sorted(date_col_map.keys())
+    first_week_date = min(all_week_dates)
+
+    planned_weeks = date_range_saturdays(first_week_date, target_week)
+    planned_missing = [fmt_date(d) for d in planned_weeks if d not in date_col_map]
+    if planned_missing:
+        raise ValueError("Thieu cot tuan cho Planned POS: " + ", ".join(planned_missing))
+
+    if current_week > target_week:
+        raise ValueError("Target Week phai lon hon hoac bang Current Week.")
+
+    net_weeks = date_range_saturdays(current_week, target_week)
+    net_missing = [fmt_date(d) for d in net_weeks if d not in date_col_map]
+    if net_missing:
+        raise ValueError("Thieu cot tuan cho NET FCST: " + ", ".join(net_missing))
+
+    planned_cols = [date_col_map[d] for d in planned_weeks]
+    net_cols = [date_col_map[d] for d in net_weeks]
+    key_cols = ["Item #", "Whse", "Coll. Class"]
+
+    si = raw[raw["Data Type"] == "SHIPPABLE INV"].copy()
+    si["Base_SI"] = get_numeric(si, target_col)
+    si_g = group_value(si, key_cols, "Base_SI", "Base_SI")
+
+    planned = raw[raw["Data Type"] == "PLANNED POS"].copy()
+    planned["PlannedPO_Sum"] = sum((get_numeric(planned, c) for c in planned_cols), start=pd.Series(0.0, index=planned.index))
+    planned_g = group_value(planned, key_cols, "PlannedPO_Sum", "PlannedPO_Sum")
+
+    firm = raw[raw["Data Type"] == "FIRM POS"].copy()
+    firm["FirmPO_Target"] = get_numeric(firm, target_col)
+    firm_g = group_value(firm, key_cols, "FirmPO_Target", "FirmPO_Target")
+
+    net_fcst = raw[raw["Data Type"] == "NET FCST"].copy()
+    net_fcst["NetFcst_Sum"] = sum((get_numeric(net_fcst, c) for c in net_cols), start=pd.Series(0.0, index=net_fcst.index))
+    net_fcst_g = group_value(net_fcst, key_cols, "NetFcst_Sum", "NetFcst_Sum")
+
+    ss = raw[raw["Data Type"] == "SAFETY STK"].copy()
+    ss["SS_Wk3"] = get_numeric(ss, target_col)
+    ss_g = group_value(ss, key_cols, "SS_Wk3", "SS_Wk3")
+
+    base = raw[raw["Data Type"].isin(["SHIPPABLE INV", "PLANNED POS", "FIRM POS", "NET FCST", "SAFETY STK"])][key_cols].drop_duplicates()
+    out = (
+        base.merge(si_g, on=key_cols, how="left")
+            .merge(planned_g, on=key_cols, how="left")
+            .merge(firm_g, on=key_cols, how="left")
+            .merge(net_fcst_g, on=key_cols, how="left")
+            .merge(ss_g, on=key_cols, how="left")
+    )
+
+    for col in ["Base_SI", "PlannedPO_Sum", "FirmPO_Target", "NetFcst_Sum", "SS_Wk3"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+
+    # Timeline Firm PO at the mapped ETA week. It is kept for reconciliation because
+    # Current SI has already subtracted this Firm PO amount from PlanDetailTimeline.
+    out["Timeline Firm PO"] = out["FirmPO_Target"]
+
+    out["F Wk3"] = 0.0
+    # SI logic applies the same formula for all warehouses, including Whse 335.
+    # Net Forecast is no longer added for Whse 335.
+    out["Sum of SI Wk3"] = out["Base_SI"] - out["PlannedPO_Sum"] - out["FirmPO_Target"]
+    out["Sum of SI-SS Wk3"] = out["Sum of SI Wk3"] - out["SS_Wk3"]
+    out["Average of SS Wk3"] = out["SS_Wk3"]
+
+    if vendor_col:
+        vendor_map = raw.groupby(["Item #", "Whse", "Coll. Class"], dropna=False)[vendor_col].first().reset_index().rename(columns={vendor_col: "Vendor"})
+        out = out.merge(vendor_map, on=key_cols, how="left")
+    else:
+        out["Vendor"] = ""
+
+    out = out.rename(columns={"Item #": "Item", "Coll. Class": "ProdResourceID"})
+    out["Item"] = out["Item"].map(normalize_item)
+    out["Whse"] = out["Whse"].map(normalize_whse)
+
+    f_wk3 = f_wk3.copy()
+    f_wk3["Item"] = f_wk3["Item"].map(normalize_item)
+    f_wk3["Whse"] = f_wk3["Whse"].map(normalize_whse)
+    out = out.merge(f_wk3, on=["Item", "Whse"], how="left", suffixes=("", "_from_prod"))
+    out["F Wk3"] = pd.to_numeric(out["F Wk3_from_prod"], errors="coerce").fillna(0.0)
+    out = out.drop(columns=["F Wk3_from_prod"])
+    out["Main Vendor"] = out["Vendor"].map(normalize_vendor)
+    out["Main Vendor F Wk3"] = out["F Wk3"]
+    out["Other Vendor Supply"] = 0.0
+    out["Other Vendor List"] = ""
+    out["PSW F Used for Reconciliation"] = out["Main Vendor F Wk3"] + out["Other Vendor Supply"]
+    out["Firm PO Reconciliation Gap"] = out["Timeline Firm PO"] - out["PSW F Used for Reconciliation"]
+    out["Total Supply Added to SI"] = (
+        out["Main Vendor F Wk3"] + out["Other Vendor Supply"] + out["Firm PO Reconciliation Gap"]
+    )
+
+    output = out[[c for c in OUTPUT_COLUMNS if c in out.columns]].drop_duplicates().copy()
+
+    merge_debug = output.merge(f_wk3, on=["Item", "Whse"], how="left", indicator=True, suffixes=("", "_prod"))
+    missing_f = merge_debug[merge_debug["_merge"] == "left_only"][["Item", "Whse", "ProdResourceID"]].drop_duplicates()
+
+    debug_rows = [
+        ["First week in converted file", fmt_date(first_week_date)],
+        ["TargetWeek", fmt_date(target_week)],
+        ["CurrentWeek", fmt_date(current_week)],
+        ["Planned POS range", ", ".join(fmt_date(d) for d in planned_weeks)],
+        ["NET FCST range", ", ".join(fmt_date(d) for d in net_weeks)],
+        ["TargetWeek column found", str(target_col)],
+        ["F Wk3 source", "PSW/Production Schedule: S/F/P = F, main vendor only, Target Week only"],
+        ["Other Vendor Supply source", "PSW vendor different from Timeline vendor; adjusted supply week between Current Week and Target Week"],
+        ["Rows output", str(len(output))],
+        ["Rows without Production F match", str(len(missing_f))],
+        ["F Wk3 total in optimizer input", str(float(output["F Wk3"].sum()))],
+        ["Other Vendor Supply total", str(float(output["Other Vendor Supply"].sum())) if "Other Vendor Supply" in output.columns else "0"],
+        ["Firm PO Reconciliation Gap total", str(float(output["Firm PO Reconciliation Gap"].sum())) if "Firm PO Reconciliation Gap" in output.columns else "0"],
+        ["Total Supply Added to SI", str(float(output["Total Supply Added to SI"].sum())) if "Total Supply Added to SI" in output.columns else str(float(output["F Wk3"].sum()))],
+        ["Whse 335 SI logic", "Same as other warehouses: SI(Target Week) - Planned POS(First week -> Target Week) - Firm POS(Target Week). Net Forecast is not added."],
+        ["Other Whse SI logic", "SI(Target Week) - Planned POS(First week -> Target Week) - Firm POS(Target Week)"],
+    ]
+    debug_df = pd.DataFrame(debug_rows, columns=["Field", "Value"])
+    return output, debug_df, missing_f
+
+
+# ============================================================
+# Step 5: Optimizer logic from destination_change_optimizer_phase2only.py
+# ============================================================
+
+@dataclass
+class PriorityRule:
+    whse: str
+    mode: str
+    value: float
+
+
+def normalize_pct(value) -> float:
+    if value is None:
+        return 0.0
+    value = float(value)
+    if value > 1 or value < -1:
+        value = value / 100.0
+    return value
+
+
+def round_to_int_units(value: float) -> int:
+    return int(round(float(value)))
+
+
+def safe_ss_ratio(current_si: float, ss_target: float) -> float:
+    if ss_target <= 0:
+        if current_si > 0:
+            return math.inf
+        if current_si < 0:
+            return -math.inf
+        return 0.0
+    return current_si / ss_target
+
+
+def current_si_after(row: dict) -> int:
+    return int(row["current_si"] + (row["final_f"] - row["orig_f"]))
+
+
+def current_ss_after(row: dict) -> float:
+    return safe_ss_ratio(current_si_after(row), row["ss_target"])
+
+
+def compute_priority_target_final(row: dict, rule: PriorityRule) -> int:
+    orig_f = row["orig_f"]
+    current_si = row["current_si"]
+    ss_target = row["ss_target"]
+    if rule.mode == "SI":
+        pct = max(0.0, min(1.0, float(rule.value)))
+        target_si_after = current_si * (1.0 - pct)
+        return max(0, round_to_int_units(orig_f + (target_si_after - current_si)))
+    if rule.mode == "SS":
+        target_si_after = ss_target * float(rule.value)
+        return max(0, round_to_int_units(orig_f + (target_si_after - current_si)))
+    return int(orig_f)
+
+
+def build_rows(group: pd.DataFrame, item_rules: Dict[str, PriorityRule]) -> Tuple[List[dict], int]:
+    rows = []
+    for _, r in group.iterrows():
+        row = {
+            "item": r["Item"],
+            "prod": r["ProdResourceID"],
+            "whse": normalize_whse(r["Whse"]),
+            "orig_f": round_to_int_units(r["F Wk3"]),
+            "current_si": round_to_int_units(r["Current SI"]),
+            "ss_target": float(r["Average of SS Wk3"]),
+            "final_f": 0,
+            "priority_rule_mode": "",
+            "priority_rule_value": None,
+            "priority_target_f_after": None,
+            "hard_locked": False,
+        }
+        rule = item_rules.get(row["whse"])
+        if rule is not None:
+            row["priority_rule_mode"] = rule.mode
+            row["priority_rule_value"] = rule.value
+            row["priority_target_f_after"] = compute_priority_target_final(row, rule)
+            row["hard_locked"] = (rule.mode == "SI" and normalize_pct(rule.value) == 0.0)
+        rows.append(row)
+    return rows, round_to_int_units(group["Firm PO Total"].iloc[0])
+
+
+def choose_priority_recipient(rows: List[dict], priority_indices: List[int]) -> Optional[int]:
+    candidates = []
+    for idx in priority_indices:
+        row = rows[idx]
+        target = row.get("priority_target_f_after")
+        if target is None or row["final_f"] >= target:
+            continue
+        gap = target - row["final_f"]
+        primary_metric = current_si_after(row) if row["priority_rule_mode"] == "SI" else current_ss_after(row)
+        secondary_metric = current_ss_after(row) if row["priority_rule_mode"] == "SI" else current_si_after(row)
+        candidates.append((gap, primary_metric, secondary_metric, row["whse"], idx))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (-x[0], x[1], x[2], x[3]))
+    return candidates[0][4]
+
+
+def choose_lowest_ss_recipient(rows: List[dict], candidate_indices: List[int]) -> Optional[int]:
+    candidates = []
+    for idx in candidate_indices:
+        after_si = current_si_after(rows[idx])
+        ratio = safe_ss_ratio(after_si, rows[idx]["ss_target"])
+        # Tie-breaker order for remaining allocation:
+        # 1) Lowest SS% After
+        # 2) Highest Safety Stock
+        # 3) Warehouse code
+        candidates.append((ratio, -rows[idx]["ss_target"], rows[idx]["whse"], idx))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]))
+    return candidates[0][3]
+
+
+def allocate_item(group: pd.DataFrame, item_rules: Dict[str, PriorityRule]) -> pd.DataFrame:
+    rows, total_f = build_rows(group, item_rules)
+
+    locked_indices = [i for i, r in enumerate(rows) if r.get("hard_locked")]
+    locked_total = sum(rows[i]["orig_f"] for i in locked_indices)
+    remaining = total_f - locked_total
+    if remaining < 0:
+        raise ValueError(f"Item {group['Item'].iloc[0]}: priority lock exceeds total firm quantity.")
+
+    for i in locked_indices:
+        rows[i]["final_f"] = rows[i]["orig_f"]
+
+    priority_indices = [i for i, r in enumerate(rows) if r["priority_rule_mode"] and i not in locked_indices]
+    non_priority_indices = [i for i, r in enumerate(rows) if not r["priority_rule_mode"] and i not in locked_indices]
+
+    while remaining > 0:
+        idx = choose_priority_recipient(rows, priority_indices)
+        if idx is None:
+            break
+        rows[idx]["final_f"] += 1
+        remaining -= 1
+
+    allocation_pool = non_priority_indices[:] if non_priority_indices else priority_indices[:]
+    if remaining > 0 and allocation_pool:
+        import heapq
+        heap = []
+        for idx in allocation_pool:
+            after_si = current_si_after(rows[idx])
+            ratio = safe_ss_ratio(after_si, rows[idx]["ss_target"])
+            heapq.heappush(heap, (ratio, -rows[idx]["ss_target"], rows[idx]["whse"], idx))
+        while remaining > 0 and heap:
+            _, _, _, idx = heapq.heappop(heap)
+            rows[idx]["final_f"] += 1
+            remaining -= 1
+            after_si = current_si_after(rows[idx])
+            ratio = safe_ss_ratio(after_si, rows[idx]["ss_target"])
+            heapq.heappush(heap, (ratio, -rows[idx]["ss_target"], rows[idx]["whse"], idx))
+
+    out = group.copy().reset_index(drop=True)
+    out["F Wk3 Original"] = out["F Wk3"].round().astype(int)
+    out["F Wk3 After Destination Change"] = [r["final_f"] for r in rows]
+    out["Net Destination Change"] = out["F Wk3 After Destination Change"] - out["F Wk3 Original"]
+    out["Current SI After"] = out["Current SI"] + out["Net Destination Change"]
+    out["SS % After"] = out.apply(lambda r: safe_ss_ratio(float(r["Current SI After"]), float(r["Average of SS Wk3"])), axis=1)
+    out["Remaining Unallocated PO"] = total_f - int(out["F Wk3 After Destination Change"].sum())
+    out["Priority Rule Mode"] = [r["priority_rule_mode"] for r in rows]
+    out["Priority Rule Value"] = [r["priority_rule_value"] for r in rows]
+    out["Priority Target F After"] = [r["priority_target_f_after"] for r in rows]
+    out["Priority Hard Locked"] = [r.get("hard_locked", False) for r in rows]
+
+    if int(out["F Wk3 Original"].sum()) != int(out["F Wk3 After Destination Change"].sum()):
+        raise ValueError(f"Item {out['Item'].iloc[0]}: tong firm khong bao toan.")
+    return out
+
+def prepare_optimizer_input(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    required = ["Item", "ProdResourceID", "Whse", "F Wk3", "Sum of SI Wk3", "Average of SS Wk3"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Optimizer input thieu cot: {missing}")
+    if not [c for c in df.columns if "vendor" in c.lower()]:
+        df[VENDOR_FALLBACK_COL] = ""
+
+    df["Item"] = df["Item"].map(normalize_item)
+    df = df[df["Item"] != ""].copy()
+    df["Whse"] = df["Whse"].map(normalize_whse)
+    for c in ["F Wk3", "Sum of SI Wk3", "Average of SS Wk3"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    if "Sum of SI-SS Wk3" in df.columns:
+        df["Sum of SI-SS Wk3"] = pd.to_numeric(df["Sum of SI-SS Wk3"], errors="coerce").fillna(0)
+    else:
+        df["Sum of SI-SS Wk3"] = pd.NA
+
+    # Business rule update:
+    # Main vendor F Wk3 is eligible for optimizer allocation. Confirmed other vendor supply
+    # and Firm PO Reconciliation Gap update SI/SS only.
+    # Total Supply Added to SI = Main Vendor F Wk3 + Other Vendor Supply + Firm PO Reconciliation Gap.
+    if "Main Vendor F Wk3" not in df.columns:
+        df["Main Vendor F Wk3"] = df["F Wk3"]
+    if "Other Vendor Supply" not in df.columns:
+        df["Other Vendor Supply"] = 0.0
+    if "Firm PO Reconciliation Gap" not in df.columns:
+        df["Firm PO Reconciliation Gap"] = 0.0
+    if "PSW F Used for Reconciliation" not in df.columns:
+        df["PSW F Used for Reconciliation"] = pd.to_numeric(df["Main Vendor F Wk3"], errors="coerce").fillna(0.0) + pd.to_numeric(df["Other Vendor Supply"], errors="coerce").fillna(0.0)
+    for _c in ["Main Vendor F Wk3", "Other Vendor Supply", "Firm PO Reconciliation Gap", "PSW F Used for Reconciliation"]:
+        df[_c] = pd.to_numeric(df[_c], errors="coerce").fillna(0.0)
+    df["Total Supply Added to SI"] = (
+        df["Main Vendor F Wk3"] + df["Other Vendor Supply"] + df["Firm PO Reconciliation Gap"]
+    )
+
+    df["Original SI Before Supply"] = df["Sum of SI Wk3"]
+    df["Original SI-SS Before Supply"] = df["Sum of SI-SS Wk3"]
+    df["New SI"] = df["Original SI Before Supply"] + df["Total Supply Added to SI"]
+    df["New SI-SS"] = df["Original SI-SS Before Supply"] + df["Total Supply Added to SI"]
+    df["Sum of SI Wk3"] = df["New SI"]
+    df["Sum of SI-SS Wk3"] = df["New SI-SS"]
+
+    df["Current SI"] = df["Sum of SI Wk3"]
+    df["Current SS%"] = df.apply(lambda r: safe_ss_ratio(float(r["Current SI"]), float(r["Average of SS Wk3"])), axis=1)
+    totals = df.groupby("Item", as_index=False)["F Wk3"].sum().rename(columns={"F Wk3": "Firm PO Total"})
+    df = df.merge(totals, on="Item", how="left")
+    return df
+
+
+def build_detail_output(detail: pd.DataFrame) -> pd.DataFrame:
+    # Keep the output layout close to the approved sample workbook.
+    # Internal calculations still use "Current SI After", but the exported column is renamed to "SI After".
+    preferred = [
+        "Item", "ProdResourceID", "Whse",
+        "F Wk3", "Sum of SI Wk3", "Sum of SI-SS Wk3", "Average of SS Wk3",
+        "Current SI", "Current SS%", "Firm PO Total",
+        "F Wk3 Original", "F Wk3 After Destination Change", "Net Destination Change",
+        "Current SI After", "SS % After", "Remaining Unallocated PO",
+        "Priority Rule Mode", "Priority Rule Value", "Priority Target F After", "Priority Hard Locked",
+        "Original SI Before Supply", "Original SI-SS Before Supply", "New SI", "New SI-SS",
+        "Main Vendor F Wk3", "Other Vendor Supply", "Timeline Firm PO", "PSW F Used for Reconciliation",
+        "Firm PO Reconciliation Gap", "Total Supply Added to SI", "Other Vendor List",
+        "Sub Vendor F Original", "Sub Vendor F After Destination Change", "Sub Vendor Net Destination Change",
+        "Sub Vendor SI Before", "Sub Vendor SI After", "Sub Vendor SS% After", "Sub Vendor DC Note",
+        "Main Vendor", "Vendor",
+    ]
+    vendor_cols = [c for c in detail.columns if "vendor" in c.lower()]
+    final_cols = [c for c in preferred if c in detail.columns]
+    for c in detail.columns:
+        if c not in final_cols and c not in vendor_cols:
+            final_cols.append(c)
+    for c in vendor_cols:
+        if c not in final_cols:
+            final_cols.append(c)
+    out = detail[final_cols].copy()
+    if "Current SI After" in out.columns:
+        out = out.rename(columns={"Current SI After": "SI After"})
+    return out
+
+
+def build_summary(detail: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for _, g in detail.groupby("Item", sort=True):
+        rows.append({
+            "Item": g["Item"].iloc[0],
+            "ProdResourceID": g["ProdResourceID"].iloc[0],
+            "Firm PO Total": int(g["Firm PO Total"].iloc[0]),
+            "Total F Before": int(g["F Wk3 Original"].sum()),
+            "Total F After": int(g["F Wk3 After Destination Change"].sum()),
+            "Min SI After": int(g["Current SI After"].min()),
+            "Max SI After": int(g["Current SI After"].max()),
+            "Min SS % After": float(g["SS % After"].min()),
+            "Max SS % After": float(g["SS % After"].max()),
+        })
+    return pd.DataFrame(rows)
+
+
+def _allocate_secondary_vendor_greedy(detail_full: pd.DataFrame, priority_rules: Optional[Dict[str, PriorityRule]] = None) -> pd.DataFrame:
+    """Add optional sub/other vendor destination-change suggestion columns to the main output.
+
+    This does not change the main-vendor optimization. It starts from the main-vendor SI After,
+    then redistributes Other Vendor Supply within the same item using the same practical balancing
+    rule: lowest SS% first, then highest Safety Stock, then warehouse code.
+    """
+    df = detail_full.copy()
+    if df.empty:
+        return df
+    if "Other Vendor Supply" not in df.columns:
+        df["Other Vendor Supply"] = 0.0
+    df["Other Vendor Supply"] = pd.to_numeric(df["Other Vendor Supply"], errors="coerce").fillna(0.0)
+
+    priority_rules = priority_rules or {}
+    sub_after_all = []
+    for _, g in df.groupby("Item", sort=True):
+        g = g.copy().reset_index()
+        orig = g["Other Vendor Supply"].round().astype(int).to_numpy()
+        total = int(orig.sum())
+        final = [0 for _ in orig]
+        if total > 0:
+            # Subvendor is optimized AFTER the main-vendor result.
+            # It uses the main-vendor SI After as its starting Current SI and applies the SAME priority rules.
+            temp = g.copy()
+            temp["F Wk3"] = orig
+            temp["Current SI"] = pd.to_numeric(temp["Current SI After"], errors="coerce").fillna(0.0)
+            temp["Average of SS Wk3"] = pd.to_numeric(temp["Average of SS Wk3"], errors="coerce").fillna(0.0)
+            temp["Firm PO Total"] = int(total)
+            item_whse = set(temp["Whse"].astype(str).tolist())
+            item_rules = {wh: rule for wh, rule in priority_rules.items() if wh in item_whse}
+            allocated = allocate_item(temp.copy(), item_rules)
+            final = pd.to_numeric(allocated["F Wk3 After Destination Change"], errors="coerce").fillna(0).astype(int).tolist()
+            # Safety check: preserve total subvendor quantity by item.
+            if int(sum(final)) != int(total):
+                final = _sum_preserving_round(np.asarray(final, dtype=float), int(total), lower=np.zeros(len(final), dtype=int)).astype(int).tolist()
+        sub_after_all.extend([(int(g.loc[i, "index"]), int(orig[i]), int(final[i])) for i in range(len(g))])
+
+    sub_df = pd.DataFrame(sub_after_all, columns=["_idx", "Sub Vendor F Original", "Sub Vendor F After Destination Change"])
+    sub_df = sub_df.set_index("_idx").sort_index()
+    df = df.join(sub_df, how="left")
+    df["Sub Vendor F Original"] = pd.to_numeric(df["Sub Vendor F Original"], errors="coerce").fillna(0).astype(int)
+    df["Sub Vendor F After Destination Change"] = pd.to_numeric(df["Sub Vendor F After Destination Change"], errors="coerce").fillna(0).astype(int)
+    df["Sub Vendor Net Destination Change"] = df["Sub Vendor F After Destination Change"] - df["Sub Vendor F Original"]
+    # Subvendor destination change is a second step after main-vendor destination change.
+    # Therefore the starting SI for subvendor must be the main-vendor SI After, not New SI.
+    df["Sub Vendor SI Before"] = pd.to_numeric(df["Current SI After"], errors="coerce").fillna(0.0)
+    df["Sub Vendor SI After"] = df["Sub Vendor SI Before"] + df["Sub Vendor Net Destination Change"]
+    df["Sub Vendor SS% After"] = df.apply(lambda r: safe_ss_ratio(float(r["Sub Vendor SI After"]), float(r["Average of SS Wk3"])), axis=1)
+    df["Sub Vendor DC Note"] = df["Sub Vendor F Original"].map(lambda x: "Suggestion only" if x > 0 else "")
+    return df
+
+
+def _sum_preserving_round(values: np.ndarray, total: int, lower: Optional[np.ndarray] = None, upper: Optional[np.ndarray] = None) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    n = len(values)
+    if lower is None:
+        lower = np.zeros(n, dtype=int)
+    else:
+        lower = np.asarray(lower, dtype=int)
+    if upper is None:
+        upper = np.full(n, max(total, 0), dtype=int)
+    else:
+        upper = np.asarray(upper, dtype=int)
+    x = np.floor(values).astype(int)
+    x = np.clip(x, lower, upper)
+    diff = int(round(total - int(x.sum())))
+    frac = values - np.floor(values)
+    guard = 0
+    while diff != 0 and guard < 100000:
+        guard += 1
+        if diff > 0:
+            candidates = [i for i in range(n) if x[i] < upper[i]]
+            if not candidates:
+                break
+            candidates.sort(key=lambda i: frac[i], reverse=True)
+            for i in candidates:
+                if diff == 0:
+                    break
+                if x[i] < upper[i]:
+                    x[i] += 1
+                    diff -= 1
+        else:
+            candidates = [i for i in range(n) if x[i] > lower[i]]
+            if not candidates:
+                break
+            candidates.sort(key=lambda i: frac[i])
+            for i in candidates:
+                if diff == 0:
+                    break
+                if x[i] > lower[i]:
+                    x[i] -= 1
+                    diff += 1
+    return x
+
+
+def apply_zero_ss_equalization(detail_full: pd.DataFrame) -> pd.DataFrame:
+    """Fallback pass for items with multiple warehouses at Average of SS Wk3 = 0.
+
+    The pass keeps total firm quantity unchanged and rebalances only the warehouses
+    with zero safety stock by shifting one unit at a time from the highest SI After
+    warehouse to the lowest SI After warehouse until the spread is small.
+    Priority-locked rows (e.g. SI = 0 hard lock) are excluded from this pass.
+    """
+    if detail_full is None or detail_full.empty:
+        return detail_full
+
+    df = detail_full.copy()
+    for col in ["F Wk3 Original", "F Wk3 After Destination Change", "Net Destination Change", "Current SI After", "Average of SS Wk3", "SS % After"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    if "Priority Hard Locked" not in df.columns:
+        df["Priority Hard Locked"] = False
+    else:
+        df["Priority Hard Locked"] = df["Priority Hard Locked"].fillna(False).astype(bool)
+
+    for item, idxs in df.groupby("Item", sort=False).groups.items():
+        zero_idxs = [i for i in idxs if float(df.at[i, "Average of SS Wk3"]) <= 0 and not bool(df.at[i, "Priority Hard Locked"])]
+        if len(zero_idxs) < 2:
+            continue
+
+        max_steps = int(df.loc[zero_idxs, "F Wk3 After Destination Change"].sum())
+        steps = 0
+        while steps < max_steps:
+            subset = df.loc[zero_idxs, ["Current SI After", "F Wk3 After Destination Change"]].copy()
+            donor = subset["Current SI After"].idxmax()
+            recipient = subset["Current SI After"].idxmin()
+            if donor == recipient:
+                break
+
+            donor_si = float(df.at[donor, "Current SI After"])
+            recipient_si = float(df.at[recipient, "Current SI After"])
+            if donor_si - recipient_si <= 1:
+                break
+            if int(df.at[donor, "F Wk3 After Destination Change"]) <= 0:
+                break
+
+            df.at[donor, "F Wk3 After Destination Change"] -= 1
+            df.at[recipient, "F Wk3 After Destination Change"] += 1
+            df.at[donor, "Net Destination Change"] -= 1
+            df.at[recipient, "Net Destination Change"] += 1
+            df.at[donor, "Current SI After"] -= 1
+            df.at[recipient, "Current SI After"] += 1
+            df.at[donor, "SS % After"] = safe_ss_ratio(float(df.at[donor, "Current SI After"]), float(df.at[donor, "Average of SS Wk3"]))
+            df.at[recipient, "SS % After"] = safe_ss_ratio(float(df.at[recipient, "Current SI After"]), float(df.at[recipient, "Average of SS Wk3"]))
+            steps += 1
+
+    return df
+
+
+def _osqp_equalize_single_item(F_orig: np.ndarray, curr_si: np.ndarray, avg_ss: np.ndarray) -> Tuple[Optional[np.ndarray], str]:
+    """OSQP second-pass optimizer: minimize SS% spread around the feasible network coverage.
+
+    It preserves total F and keeps x >= 0. If OSQP/scipy is unavailable or the item is not applicable,
+    returns (None, reason).
+    """
+    try:
+        import osqp  # type: ignore
+        from scipy import sparse  # type: ignore
+    except Exception as exc:
+        return None, f"OSQP unavailable: {exc}"
+
+    # Work with integer shipment quantities. This is important because the output
+    # Net Destination Change is calculated against integer Original F.
+    # Using round(sum(F_orig)) can create a non-zero total net when individual
+    # rows contain decimals. Use sum(round(each row)) instead.
+    F_orig = np.asarray(F_orig, dtype=float)
+    F_orig = np.rint(F_orig).astype(float)
+    curr_si = np.asarray(curr_si, dtype=float)
+    avg_ss = np.asarray(avg_ss, dtype=float)
+    n = len(F_orig)
+    total_f = int(np.sum(F_orig))
+    if n <= 1 or total_f <= 0:
+        return None, "Not applicable: one warehouse or zero total F"
+
+    valid = avg_ss > 0
+    if not np.any(valid):
+        return None, "Not applicable: all SS are zero"
+
+    # Option B: equalize coverage between participating warehouses, not necessarily to 100%.
+    # Feasible target coverage is based on the network after preserving total F.
+    total_final_si = float(np.sum(curr_si + (F_orig * 0)))  # sum of current SI before reallocation
+    target_ratio = total_final_si / float(np.sum(avg_ss[valid])) if float(np.sum(avg_ss[valid])) != 0 else 0.0
+
+    k = np.zeros(n)
+    c = np.zeros(n)
+    weights = np.ones(n)
+    mean_ss = np.mean(avg_ss[valid]) if np.any(valid) else 1.0
+    for i in range(n):
+        if avg_ss[i] > 0:
+            k[i] = 1.0 / avg_ss[i]
+            c[i] = (curr_si[i] - F_orig[i]) / avg_ss[i] - target_ratio
+            weights[i] = min(max(avg_ss[i] / mean_ss, 0.1), 10.0)
+        else:
+            # Avoid unstable zero-SS rows. Movement penalty still keeps them reasonable.
+            k[i] = 0.0
+            c[i] = 0.0
+            weights[i] = 0.1
+
+    alpha_move = 1e-5
+    P_diag = 2.0 * weights * (k ** 2) + 2.0 * alpha_move
+    q = 2.0 * weights * k * c - 2.0 * alpha_move * F_orig
+    P = sparse.diags(P_diag, format="csc")
+    A = sparse.vstack([
+        sparse.csr_matrix(np.ones((1, n))),
+        sparse.eye(n, format="csc"),
+    ], format="csc")
+    l = np.concatenate([[total_f], np.zeros(n)])
+    u = np.concatenate([[total_f], np.full(n, max(total_f, int(np.max(F_orig) * 2) + total_f + 1))])
+
+    prob = osqp.OSQP()
+    prob.setup(P=P, q=q, A=A, l=l, u=u, verbose=False, eps_abs=1e-5, eps_rel=1e-5, max_iter=30000, polish=True)
+    res = prob.solve()
+    if res.info.status_val not in (1, 2) or res.x is None:
+        return None, f"OSQP failed: {res.info.status}"
+    x_int = _sum_preserving_round(res.x[:n], total_f, lower=np.zeros(n, dtype=int))
+    return x_int, "OSQP Equalize SS%"
+
+
+def build_osqp_sheets(detail_full: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """Build optional OSQP sheets for main vendor and sub/other vendor.
+
+    Main vendor OSQP starts from New SI before current/main destination change.
+    Sub vendor OSQP starts after the OSQP main-vendor result when available; otherwise after current main result.
+    """
+    sheets: Dict[str, pd.DataFrame] = {}
+    if detail_full is None or detail_full.empty:
+        return sheets
+
+    main_records = []
+    sub_records = []
+    main_si_after_by_index = {}
+
+    for _, g0 in detail_full.groupby("Item", sort=True):
+        g = g0.copy().reset_index()
+        f_orig = pd.to_numeric(g["F Wk3 Original"], errors="coerce").fillna(0).to_numpy(dtype=float)
+        curr_si = pd.to_numeric(g["Current SI"], errors="coerce").fillna(0).to_numpy(dtype=float)
+        avg_ss = pd.to_numeric(g["Average of SS Wk3"], errors="coerce").fillna(0).to_numpy(dtype=float)
+        x, status = _osqp_equalize_single_item(f_orig, curr_si, avg_ss)
+        if x is None:
+            x = pd.to_numeric(g["F Wk3 After Destination Change"], errors="coerce").fillna(0).to_numpy(dtype=int)
+        for i in range(len(g)):
+            net = int(x[i]) - int(round(f_orig[i]))
+            si_after = float(curr_si[i]) + net
+            main_si_after_by_index[int(g.loc[i, "index"])] = si_after
+            main_records.append({
+                "Item": g.loc[i, "Item"],
+                "ProdResourceID": g.loc[i, "ProdResourceID"],
+                "Whse": g.loc[i, "Whse"],
+                "Vendor": g.loc[i, "Vendor"] if "Vendor" in g.columns else "",
+                "F Wk3 Original": int(round(f_orig[i])),
+                "OSQP F Wk3 After Destination Change": int(x[i]),
+                "OSQP Net Destination Change": net,
+                "OSQP SI After": si_after,
+                "OSQP SS% After": safe_ss_ratio(si_after, float(avg_ss[i])),
+                "Average of SS Wk3": float(avg_ss[i]),
+                "OSQP Method/Status": status,
+            })
+
+        sub_orig = pd.to_numeric(g["Other Vendor Supply"], errors="coerce").fillna(0).to_numpy(dtype=float) if "Other Vendor Supply" in g.columns else np.zeros(len(g))
+        # Use integer sub-vendor original quantities for both OSQP constraint and net-change reporting.
+        # This guarantees SUM(OSQP Sub Vendor Net Destination Change) = 0 by item.
+        sub_orig_int = np.rint(sub_orig).astype(int)
+        sub_curr_si = np.array([main_si_after_by_index.get(int(g.loc[i, "index"]), float(g.loc[i, "Current SI After"])) for i in range(len(g))], dtype=float)
+        sx, sstatus = _osqp_equalize_single_item(sub_orig_int, sub_curr_si, avg_ss)
+        if sx is None:
+            sx = pd.to_numeric(g.get("Sub Vendor F After Destination Change", pd.Series(np.zeros(len(g)))), errors="coerce").fillna(0).to_numpy(dtype=int)
+        sx = np.asarray(sx, dtype=int)
+        # Last safety check: force total sub-vendor after quantity to equal total original quantity.
+        sx = _sum_preserving_round(sx.astype(float), int(sub_orig_int.sum()), lower=np.zeros(len(sx), dtype=int))
+        for i in range(len(g)):
+            snet = int(sx[i]) - int(sub_orig_int[i])
+            ssi_after = float(sub_curr_si[i]) + snet
+            sub_records.append({
+                "Item": g.loc[i, "Item"],
+                "ProdResourceID": g.loc[i, "ProdResourceID"],
+                "Whse": g.loc[i, "Whse"],
+                "Other Vendor List": g.loc[i, "Other Vendor List"] if "Other Vendor List" in g.columns else "",
+                "Sub Vendor F Original": int(sub_orig_int[i]),
+                "OSQP Sub Vendor SI Before": float(sub_curr_si[i]),
+                "OSQP Sub Vendor F After Destination Change": int(sx[i]),
+                "OSQP Sub Vendor Net Destination Change": snet,
+                "OSQP Sub Vendor SI After": ssi_after,
+                "OSQP Sub Vendor SS% After": safe_ss_ratio(ssi_after, float(avg_ss[i])),
+                "Average of SS Wk3": float(avg_ss[i]),
+                "OSQP Method/Status": sstatus,
+            })
+
+    sheets["OSQP Main Vendor"] = pd.DataFrame(main_records)
+    sheets["OSQP Sub Vendor"] = pd.DataFrame(sub_records)
+    return sheets
+
+
+def run_optimizer(
+    optimizer_input: pd.DataFrame,
+    priority_rules: Optional[Dict[str, PriorityRule]] = None,
+    return_full: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame] | Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    priority_rules = priority_rules or {}
+    df = prepare_optimizer_input(optimizer_input)
+    records = []
+    for _, group in df.groupby("Item", sort=True):
+        item_whse = set(group["Whse"].astype(str).tolist())
+        item_rules = {wh: rule for wh, rule in priority_rules.items() if wh in item_whse}
+        allocated = allocate_item(group.copy(), item_rules)
+        records.extend(allocated.to_dict("records"))
+    detail_full = pd.DataFrame.from_records(records) if records else pd.DataFrame()
+    if not detail_full.empty and int(detail_full["F Wk3 Original"].sum()) != int(detail_full["F Wk3 After Destination Change"].sum()):
+        raise ValueError("Sai tong Firm PO toan file.")
+
+    detail_full = apply_zero_ss_equalization(detail_full)
+    detail_full = _allocate_secondary_vendor_greedy(detail_full, priority_rules=priority_rules)
+    detail = build_detail_output(detail_full)
+    summary = build_summary(detail_full)
+    if return_full:
+        return detail, summary, detail_full
+    return detail, summary
+
+
+# ============================================================
+# Output writer
+# ============================================================
+
+def autofit(ws):
+    for col_cells in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for cell in col_cells:
+            value = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, len(value))
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 45)
+
+
+def style_sheet(ws):
+    ws.freeze_panes = "A2"
+    for cell in ws[1]:
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+    autofit(ws)
+
+
+def write_excel_output(
+    output_path: str,
+    detail: pd.DataFrame,
+    summary: pd.DataFrame,
+    optimizer_input: pd.DataFrame,
+    debug_sheets: Dict[str, pd.DataFrame],
+    extra_sheets: Optional[Dict[str, pd.DataFrame]] = None,
+):
+    output_path = ensure_unique_output_path(output_path)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        detail.to_excel(writer, sheet_name="Optimized Data", index=False)
+        summary.to_excel(writer, sheet_name="Summary", index=False)
+        optimizer_input.to_excel(writer, sheet_name="Optimizer Input Debug", index=False)
+        for name, df in debug_sheets.items():
+            safe_name = name[:31]
+            df.to_excel(writer, sheet_name=safe_name, index=False)
+        for name, df in (extra_sheets or {}).items():
+            safe_name = name[:31]
+            if df is not None and not df.empty:
+                df.to_excel(writer, sheet_name=safe_name, index=False)
+        logic = pd.DataFrame([
+            ["Input PlanDetailTimeline", "Raw CSV, code tu dong bo qua metadata lines truoc dong Item #"],
+            ["ETA -> ETD", "Plan week value is shifted earlier by Used Offset Weeks from DueDateCalc/legacy mapping"],
+            ["Main vendor", "Timeline Vendor is the main vendor. PSW rows with the same vendor are main vendor rows."],
+            ["Other vendor", "PSW Vendor different from Timeline Vendor. Used for SI/SS supply update only, not destination allocation."],
+            ["F Wk3", "Main vendor PSW, only S/F/P = F, PSW ETD Week = Target Week, grouped by Item + Whse"],
+            ["Adjusted Supply Week", "For other vendors: PSW ETD Week + Vendor Transit Weeks - Warehouse Offset Weeks"],
+            ["Other Vendor Supply", "Confirmed other vendor PSW F quantity where Adjusted Supply Week is between Current Week and Target Week"],
+            ["Firm PO Reconciliation Gap", "= Timeline Firm PO at mapped ETA week - PSW F used for reconciliation"],
+            ["Total Supply Added to SI", "= Main Vendor F Wk3 + Other Vendor Supply + Firm PO Reconciliation Gap"],
+            ["New SI", "= Original SI Before Supply + Total Supply Added to SI"],
+            ["New SI-SS", "= Original SI-SS Before Supply + Total Supply Added to SI"],
+            ["Current SI", "= New SI; optimizer allocation uses this value"],
+            ["Current SS%", "= Current SI / Average of SS Wk3"],
+            ["F Wk3 After", "Firm cuoi cung cua kho sau destination change"],
+            ["Net Destination Change", "= F Wk3 After - F Wk3 Original"],
+            ["SI After", "= New SI + main-vendor Net Destination Change"],
+            ["SS % After", "= SI After / Average of SS Wk3"],
+            ["Sub Vendor DC columns", "Suggestion only. Sub Vendor SI Before = main-vendor SI After; same priority rules are applied to subvendor suggestion."],
+            ["Optional OSQP sheets", "Second-pass what-if sheets. Option B objective: equalize SS% across participating warehouses while preserving total F."],
+            ["Priority mode SI", "Target la cover theo % huong toi SI = 0; neu value = 0 thi hard lock F Wk3"],
+            ["Priority mode SS", "Target %SS dung cong thuc SI / SS"],
+            ["Zero-SS fallback", "If an item has 2+ zero-SS warehouses, run a fallback equalization pass on SI After"],
+            ["Allocation rule", "Sau priority, luon chon kho co SS% After thap nhat"],
+        ], columns=["Field", "Meaning"])
+        logic.to_excel(writer, sheet_name="Logic", index=False)
+
+        wb = writer.book
+        for ws in wb.worksheets:
+            style_sheet(ws)
+            for row in ws.iter_rows(min_row=2):
+                for cell in row:
+                    header = ws.cell(1, cell.column).value
+                    if header in ["Current SS%", "SS % After", "Sub Vendor SS% After", "OSQP SS% After", "OSQP Sub Vendor SS% After", "Priority Rule Value"] and isinstance(cell.value, (int, float)) and not math.isinf(cell.value):
+                        cell.number_format = "0.0%"
+    return output_path
+
+
+# ============================================================
+# One-shot process
+# ============================================================
+
+def process_files(
+    plan_detail_csv: str,
+    production_schedule_csv: str,
+    due_date_calc_xlsx: str,
+    output_path: str,
+    target_week: date,
+    current_week: Optional[date] = None,
+    priority_rules: Optional[Dict[str, PriorityRule]] = None,
+    offset_mode: str = "legacy_compatible",
+    psw_csv_paths: Optional[List[str]] = None,
+    other_due_date_calc_xlsx: Optional[str] = None,
+    due_date_calc_xlsx_list: Optional[List[str]] = None,
+    use_osqp_second_pass: bool = False,
+) -> str:
+    if current_week is None:
+        current_week = saturday_of_current_week()
+
+    # DueDateCalc upload order can now follow detected PlanDetailTimeline vendor order.
+    # The first file remains the default/main fallback for legacy compatibility.
+    due_list = [p for p in (due_date_calc_xlsx_list or []) if p]
+    if not due_list:
+        due_list = [due_date_calc_xlsx]
+        if other_due_date_calc_xlsx:
+            due_list.append(other_due_date_calc_xlsx)
+
+    offset_map, offset_debug = load_due_date_offsets(due_list[0], offset_mode=offset_mode)
+    other_offset_map = offset_map
+    other_offset_debug = pd.DataFrame([["Sub Vendor DueDateCalc", "Not provided; using main/default DueDateCalc fallback"]], columns=["Field", "Value"])
+    if len(due_list) > 1:
+        other_offset_map, other_offset_debug = load_due_date_offsets(due_list[1], offset_mode=offset_mode)
+
+    f_wk3, prod_debug = load_fwk3_from_production(production_schedule_csv, target_week)
+    all_psw_paths = psw_csv_paths if psw_csv_paths else [production_schedule_csv]
+
+    # DueDateCalc upload order now follows vendor order detected from PSW / Production Schedule.
+    # This is more reliable for multi-vendor files because PSW contains all vendors, while
+    # PlanDetailTimeline often shows only the main vendor.
+    psw_vendor_df = detect_psw_vendors(all_psw_paths)
+    vendor_offset_maps, vendor_due_debug = build_vendor_offset_maps(psw_vendor_df, due_list, offset_mode=offset_mode)
+    psw_supply_detail, psw_read_debug = load_psw_vendor_supply(
+        all_psw_paths, target_week, current_week, offset_map, other_vendor_offset_map=other_offset_map,
+        vendor_offset_maps=vendor_offset_maps,
+    )
+    optimizer_input, build_debug, missing_f, plan_offset_debug, psw_vendor_detail, psw_supply_debug = build_optimizer_input_direct_from_plan(
+        plan_detail_csv, offset_map, f_wk3, target_week, current_week,
+        psw_supply_detail=psw_supply_detail,
+        vendor_offset_maps=vendor_offset_maps,
+    )
+    convert_debug = pd.DataFrame([
+        ["Conversion mode", "Direct fast path, equivalent to ETA -> ETD shift without writing converted workbook"],
+        ["Materialized converted workbook", "No"],
+    ], columns=["Field", "Value"])
+    detail, summary, detail_full = run_optimizer(optimizer_input, priority_rules=priority_rules, return_full=True)
+    osqp_sheets = build_osqp_sheets(detail_full) if use_osqp_second_pass else {}
+
+    run_debug = pd.DataFrame([
+        ["PlanDetailTimeline", plan_detail_csv],
+        ["Production Schedule", production_schedule_csv],
+        ["PSW files used for multi-vendor supply", ", ".join(all_psw_paths)],
+        ["PSW upload order rule", "First PSW file may contain both vendors; vendor matching to Timeline decides MAIN vs OTHER. Second/subsequent PSW files are OTHER vendor sources"],
+        ["DueDateCalc files uploaded", ", ".join(due_list)],
+        ["DueDateCalc mapping rule", "Upload order follows detected PlanDetailTimeline vendor order; if fewer files than vendors, the last file is fallback"],
+        ["TargetWeek", fmt_date(target_week)],
+        ["CurrentWeek", fmt_date(current_week)],
+        ["Offset mode", offset_mode],
+        ["Output detail rows", len(detail)],
+        ["OSQP second-pass sheets", "Enabled" if use_osqp_second_pass else "Disabled"],
+        ["Total F original", int(detail["F Wk3 Original"].sum()) if not detail.empty else 0],
+        ["Total F after", int(detail["F Wk3 After Destination Change"].sum()) if not detail.empty else 0],
+    ], columns=["Field", "Value"])
+
+    debug_sheets = {
+        "Run Debug": run_debug,
+        "DueDate Main Offset Debug": offset_debug,
+        "DueDate Sub Offset Debug": other_offset_debug,
+        "Timeline Vendor Due Mapping": vendor_due_debug,
+        "Plan Convert Debug": convert_debug,
+        "Plan Offset Debug": plan_offset_debug,
+        "Production Debug": prod_debug,
+        "PSW Read Debug": psw_read_debug,
+        "PSW Supply Debug": psw_supply_debug,
+        "Other Vendor Supply Detail": psw_vendor_detail,
+        "Build Debug": build_debug,
+        "Missing F Match": missing_f,
+    }
+    return write_excel_output(output_path, detail, summary, optimizer_input, debug_sheets, extra_sheets=osqp_sheets)
+
+
+# ============================================================
+# Tkinter UI
+# ============================================================
+
+def ask_priority_rules(warehouses: List[str]) -> Dict[str, PriorityRule]:
+    rules: Dict[str, PriorityRule] = {}
+    if simpledialog is None or tk is None:
+        return rules
+    root = tk.Tk()
+    root.withdraw()
+    valid = set(warehouses)
+    raw = simpledialog.askstring(
+        "Kho uu tien",
+        "Nhap mot hoac nhieu kho uu tien, cach nhau bang dau phay.\n"
+        "Vi du: 11,17,28\n"
+        "De trong neu khong co kho uu tien.",
+    )
+    if not raw:
+        root.destroy()
+        return rules
+    selected = []
+    for x in raw.split(","):
+        wh = normalize_whse(x)
+        if wh and wh in valid and wh not in selected:
+            selected.append(wh)
+    for wh in selected:
+        mode = simpledialog.askstring(
+            f"Rule cho kho {wh}",
+            "Nhap mode cho kho nay:\n- SI: cover mot phan toi SI = 0\n- SS: cover toi mot muc %SS nhat dinh",
+        )
+        if not mode:
+            continue
+        mode = mode.strip().upper()
+        if mode == "SI":
+            val = simpledialog.askfloat(f"% cover SI cho kho {wh}", "Vi du 50 = cover 50%, 100 = full toi SI=0")
+            if val is not None:
+                rules[wh] = PriorityRule(whse=wh, mode="SI", value=normalize_pct(val))
+        elif mode == "SS":
+            val = simpledialog.askfloat(f"Target %SS cho kho {wh}", "Vi du 0 = SI bang SS; -100 = SI bang 0; 100 = SI bang 2 lan SS")
+            if val is not None:
+                rules[wh] = PriorityRule(whse=wh, mode="SS", value=normalize_pct(val))
+    root.destroy()
+    return rules
+
+
+class UnifiedApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Destination Change Unified Flow")
+        self.root.geometry("980x680")
+        self.root.minsize(920, 620)
+        self.plan_var = tk.StringVar()
+        self.prod_var = tk.StringVar()
+        self.due_var = tk.StringVar()
+        self.output_var = tk.StringVar()
+        default_current = saturday_of_current_week()
+        self.current_var = tk.StringVar(value=fmt_date(default_current))
+        self.target_var = tk.StringVar(value=fmt_date(default_current + timedelta(days=14)))
+        self.offset_mode_var = tk.StringVar(value="legacy_compatible")
+        self.status_var = tk.StringVar(value="San sang")
+        self.build_ui()
+
+    def build_ui(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Title.TLabel", font=("Segoe UI", 15, "bold"))
+        style.configure("Big.TButton", font=("Segoe UI", 12, "bold"), padding=(16, 12))
+        outer = ttk.Frame(self.root, padding=16)
+        outer.pack(fill="both", expand=True)
+        ttk.Label(outer, text="Destination Change Unified Flow", style="Title.TLabel").pack(anchor="w", pady=(0, 12))
+
+        files = ttk.LabelFrame(outer, text="Input / Output files")
+        files.pack(fill="x", pady=(0, 12))
+        self.file_row(files, 0, "PlanDetailTimeline raw CSV:", self.plan_var, self.browse_plan)
+        self.file_row(files, 2, "Production Schedule raw CSV:", self.prod_var, self.browse_prod)
+        self.file_row(files, 4, "DueDateCalc Excel:", self.due_var, self.browse_due)
+        self.file_row(files, 6, "Output Excel:", self.output_var, self.browse_output, save=True)
+        files.columnconfigure(1, weight=1)
+
+        dates = ttk.LabelFrame(outer, text="Week setup")
+        dates.pack(fill="x", pady=(0, 12))
+        ttk.Label(dates, text="Target Week / Wk3:").grid(row=0, column=0, sticky="w", padx=10, pady=10)
+        ttk.Entry(dates, textvariable=self.target_var, width=20).grid(row=0, column=1, sticky="w", padx=10, pady=10)
+        ttk.Label(dates, text="Current Week:").grid(row=1, column=0, sticky="w", padx=10, pady=10)
+        ttk.Entry(dates, textvariable=self.current_var, width=20).grid(row=1, column=1, sticky="w", padx=10, pady=10)
+        ttk.Label(dates, text="ETA -> ETD offset mode:").grid(row=2, column=0, sticky="w", padx=10, pady=10)
+        ttk.Combobox(dates, textvariable=self.offset_mode_var, values=["legacy_compatible", "due_date"], state="readonly", width=24).grid(row=2, column=1, sticky="w", padx=10, pady=10)
+
+        info = ttk.LabelFrame(outer, text="Logic summary")
+        info.pack(fill="x", pady=(0, 12))
+        logic_text = (
+            "1) PlanDetailTimeline raw CSV -> auto skip metadata -> ETA converted to ETD by warehouse offset.\n"
+            "2) Production Schedule -> F Wk3 from S/F/P = F only, target week column must match user input.\n"
+            "3) Build optimizer input with SI, SI-SS, SS, Vendor + F Wk3.\n"
+            "4) Run destination change optimizer and write final Excel with debug sheets."
+        )
+        ttk.Label(info, text=logic_text, justify="left", wraplength=900).pack(anchor="w", padx=10, pady=10)
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x")
+        ttk.Label(actions, textvariable=self.status_var).pack(side="left")
+        ttk.Button(actions, text="RUN", command=self.run, style="Big.TButton").pack(side="right")
+
+    def file_row(self, parent, row, label, var, command, save=False):
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=10, pady=(8, 2))
+        ttk.Entry(parent, textvariable=var).grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 8))
+        ttk.Button(parent, text="Save As" if save else "Browse", command=command).grid(row=row + 1, column=2, sticky="e", padx=10, pady=(0, 8))
+
+    def browse_plan(self):
+        p = filedialog.askopenfilename(title="Select PlanDetailTimeline CSV", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if p:
+            self.plan_var.set(p)
+            self.default_output_from_plan(p)
+
+    def browse_prod(self):
+        p = filedialog.askopenfilename(title="Select Production Schedule CSV", filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+        if p:
+            self.prod_var.set(p)
+
+    def browse_due(self):
+        p = filedialog.askopenfilename(title="Select DueDateCalc Excel", filetypes=[("Excel files", "*.xlsx *.xlsm *.xls"), ("All files", "*.*")])
+        if p:
+            self.due_var.set(p)
+
+    def browse_output(self):
+        p = filedialog.asksaveasfilename(title="Save output", defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
+        if p:
+            self.output_var.set(p)
+
+    def default_output_from_plan(self, plan_path):
+        if not self.output_var.get().strip():
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.output_var.set(str(Path(plan_path).with_name(f"destination_change_unified_{stamp}.xlsx")))
+
+    def run(self):
+        try:
+            plan = self.plan_var.get().strip()
+            prod = self.prod_var.get().strip()
+            due = self.due_var.get().strip()
+            out = self.output_var.get().strip()
+            if not plan or not prod or not due or not out:
+                raise ValueError("Ban can chon day du 4 file/path: PlanDetailTimeline, Production Schedule, DueDateCalc, Output.")
+            target_week = parse_user_date(self.target_var.get())
+            current_week = parse_user_date(self.current_var.get())
+            self.status_var.set("Dang doc warehouse list de nhap priority...")
+            self.root.update_idletasks()
+            # Build a preliminary F list to know warehouses. If this fails, main run will show error.
+            prod_f, _ = load_fwk3_from_production(prod, target_week)
+            whses = sorted(prod_f["Whse"].dropna().astype(str).unique().tolist(), key=lambda x: (len(x), x))
+            rules = ask_priority_rules(whses)
+            self.status_var.set("Dang xu ly full flow...")
+            self.root.update_idletasks()
+            final_path = process_files(
+                plan_detail_csv=plan,
+                production_schedule_csv=prod,
+                due_date_calc_xlsx=due,
+                output_path=out,
+                target_week=target_week,
+                current_week=current_week,
+                priority_rules=rules,
+                offset_mode=self.offset_mode_var.get(),
+            )
+            self.status_var.set("Hoan tat")
+            messagebox.showinfo("Done", f"Da tao file output:\n{final_path}")
+        except Exception as e:
+            self.status_var.set("Co loi")
+            messagebox.showerror("Error", str(e))
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def main():
+    parser = argparse.ArgumentParser(description="Destination Change Unified Flow")
+    parser.add_argument("--plan", help="PlanDetailTimeline raw CSV")
+    parser.add_argument("--production", help="Production Schedule raw CSV")
+    parser.add_argument("--psw", action="append", help="Optional PSW CSV. Can be used multiple times. Upload/order matters: first --psw = main vendor file, second/subsequent --psw = other vendor file. If omitted, --production is used as the main vendor file.")
+    parser.add_argument("--due", help="Main/default DueDateCalc Excel")
+    parser.add_argument("--other-due", help="Optional sub/other vendor DueDateCalc Excel. If omitted, sub vendors use the main/default DueDateCalc transit.")
+    parser.add_argument("--target-week", help="Target week, e.g. 5/23/2026")
+    parser.add_argument("--current-week", help="Current week, e.g. 5/9/2026")
+    parser.add_argument("--output", help="Output Excel path")
+    parser.add_argument("--offset-mode", choices=["legacy_compatible", "due_date"], default="legacy_compatible")
+    parser.add_argument("--use-osqp", action="store_true", help="Add optional OSQP second-pass sheets for main and sub vendors")
+    parser.add_argument("--no-gui", action="store_true", help="Run CLI only")
+    args = parser.parse_args()
+
+    if args.no_gui or all([args.plan, args.production, args.due, args.target_week, args.output]):
+        if not all([args.plan, args.production, args.due, args.target_week, args.output]):
+            raise SystemExit("CLI mode requires --plan --production --due --target-week --output")
+        final = process_files(
+            plan_detail_csv=args.plan,
+            production_schedule_csv=args.production,
+            due_date_calc_xlsx=args.due,
+            output_path=args.output,
+            target_week=parse_user_date(args.target_week),
+            current_week=parse_user_date(args.current_week) if args.current_week else None,
+            priority_rules={},
+            offset_mode=args.offset_mode,
+            psw_csv_paths=args.psw,
+            other_due_date_calc_xlsx=args.other_due,
+            use_osqp_second_pass=args.use_osqp,
+        )
+        print(f"Done: {final}")
+        return
+
+    if tk is None:
+        raise SystemExit("Tkinter khong kha dung. Hay chay CLI voi --no-gui va cac tham so input.")
+    root = tk.Tk()
+    UnifiedApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
